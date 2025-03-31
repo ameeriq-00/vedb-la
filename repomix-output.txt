@@ -1868,7 +1868,9 @@ class VehicleStatusController extends Controller
         if ($vehicle->donation_status != 'مهداة') {
             return redirect()->back()->with('error', 'لا يمكن تحديث حالة الترقيم الحكومي إلا بعد إهداء العجلة');
         }
-        
+        if (!auth()->user()->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
+            return redirect()->back()->with('error', 'غير مصرح لك بتحديث حالة الترقيم الحكومي');
+        }
         // Going back from registered to not registered requires admin/verifier
         if ($vehicle->government_registration_status === 'مرقمة' && $validatedData['government_registration_status'] === 'غير مرقمة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
@@ -3743,6 +3745,9 @@ class AuthServiceProvider extends ServiceProvider
         $this->registerPolicies();
 
         // إعطاء صلاحية لمستخدمي الآليات لإضافة عجلات حكومية
+        Gate::define('create-government-vehicle', function (User $user) {
+            return $user->hasRole(['admin', 'verifier', 'vehicles_dept']);
+        });
         Gate::define('create-government-vehicle', function (User $user) {
             return $user->hasRole(['admin', 'verifier', 'vehicles_dept']);
         });
@@ -6437,6 +6442,7 @@ class RolesAndPermissionsSeeder extends Seeder
             'create transfers',
             'update vehicle status',
             'view reports',
+            'create vehicles',
         ]);
         
         // 5. Recipient (المستلم)
@@ -7317,6 +7323,39 @@ import './bootstrap';
             padding: 0.25rem 0.5rem;
             font-size: 0.75rem;
         }
+        .dropdown-menu {
+        z-index: 1030; /* قيمة أعلى من z-index الافتراضي لضمان ظهور القائمة المنسدلة فوق العناصر الأخرى */
+        }
+    
+            .navbar .dropdown-menu {
+            position: absolute;
+            right: 0;
+            left: auto;
+        }
+    
+        @media (max-width: 767.98px) {
+            .navbar .dropdown-menu {
+                position: absolute;
+                right: 0;
+                left: auto;
+                width: 280px !important; /* عرض أصغر على الشاشات الصغيرة */
+            }
+        }
+    
+        /* تحسين شكل عناصر القائمة المنسدلة */
+        .dropdown-menu .list-group-item {
+            border-left: none;
+            border-right: none;
+        }
+    
+        .dropdown-menu .list-group-item:first-child {
+            border-top: none;
+        }
+    
+        .dropdown-menu .list-group-item:last-child {
+            border-bottom: none;
+        }
+
     </style>
     
     @stack('styles')
@@ -7331,89 +7370,89 @@ import './bootstrap';
                 aria-controls="sidebarMenu" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
         </button>
+        
+        <!-- شريط البحث إذا كان موجودًا -->
         <div class="w-100"></div>
-        <div class="navbar-nav">
-            <div class="nav-item text-nowrap">
-                @auth
-                <span class="nav-link px-3 text-white">{{ auth()->user()->name }}</span>
-                @endauth
-            </div>
-        </div>
-        <div class="navbar-nav">
-        <div class="navbar-nav">
-    @auth
-    <div class="nav-item dropdown mx-2">
-        <a class="nav-link dropdown-toggle position-relative" href="#" id="notificationsDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-            <i class="bi bi-bell"></i>
-            @if(auth()->user()->unreadNotifications()->count() > 0)
-            <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
-                {{ auth()->user()->unreadNotifications()->count() > 99 ? '99+' : auth()->user()->unreadNotifications()->count() }}
-            </span>
-            @endif
-        </a>
-        <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="notificationsDropdown" style="width: 320px;">
-            <li>
-                <h6 class="dropdown-header d-flex justify-content-between align-items-center">
-                    الإشعارات
+        
+        <!-- قائمة الإشعارات والمستخدم -->
+        <div class="d-flex align-items-center">
+            <!-- قائمة الإشعارات -->
+            @auth
+            <div class="dropdown me-3">
+                <button class="btn btn-dark position-relative dropdown-toggle" type="button" id="notificationsDropdown" data-bs-toggle="dropdown" aria-expanded="false" style="background:none; border:none;">
+                    <i class="bi bi-bell text-light"></i>
                     @if(auth()->user()->unreadNotifications()->count() > 0)
-                    <form action="{{ route('notifications.mark-all-as-read') }}" method="POST" class="d-inline">
-                        @csrf
-                        <button type="submit" class="btn btn-sm btn-link p-0 text-decoration-none">
-                            تحديد الكل كمقروء
-                        </button>
-                    </form>
+                    <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
+                        {{ auth()->user()->unreadNotifications()->count() > 99 ? '99+' : auth()->user()->unreadNotifications()->count() }}
+                    </span>
                     @endif
-                </h6>
-            </li>
-            @forelse(auth()->user()->unreadNotifications()->take(5)->get() as $notification)
-            <li>
-                <div class="dropdown-item">
-                    @if(isset($notification->data['status_type_name']))
-                    <div class="small text-muted">تم تحديث حالة عجلة</div>
-                    <div>
-                        {{ $notification->data['status_type_name'] ?? '' }}: 
-                        {{ $notification->data['old_status'] ?? '' }} → {{ $notification->data['new_status'] ?? '' }}
-                    </div>
-                    @elseif(isset($notification->data['transfer_type']))
-                    <div class="small text-muted">{{ $notification->data['transfer_type'] ?? 'مناقلة' }}</div>
-                    <div>
-                        عجلة: {{ $notification->data['vehicle_type'] ?? '' }} - {{ $notification->data['vehicle_number'] ?? '' }}
-                    </div>
-                    @else
-                    <div>إشعار جديد</div>
-                    @endif
-                    <div class="small">
-                        <a href="
-                            @if(isset($notification->data['vehicle_id']))
-                                {{ route('vehicles.show', $notification->data['vehicle_id']) }}
-                            @elseif(isset($notification->data['transfer_id']))
-                                {{ route('transfers.show', $notification->data['transfer_id']) }}
-                            @else
-                                {{ route('notifications.index') }}
+                </button>
+                <div class="dropdown-menu dropdown-menu-end p-0" style="width: 320px; max-height: 400px; overflow-y: auto;">
+                    <div class="card m-0 border-0">
+                        <div class="card-header bg-light d-flex justify-content-between py-2">
+                            <span class="fw-bold">الإشعارات</span>
+                            @if(auth()->user()->unreadNotifications()->count() > 0)
+                            <form action="{{ route('notifications.mark-all-as-read') }}" method="POST" class="d-inline">
+                                @csrf
+                                <button type="submit" class="btn btn-sm btn-link p-0 text-decoration-none">
+                                    تحديد الكل كمقروء
+                                </button>
+                            </form>
                             @endif
-                        ">عرض التفاصيل</a>
+                        </div>
+                        <div class="card-body p-0">
+                            <div class="list-group list-group-flush">
+                                @forelse(auth()->user()->unreadNotifications()->take(5)->get() as $notification)
+                                <a href="{{ isset($notification->data['vehicle_id']) ? route('vehicles.show', $notification->data['vehicle_id']) : (isset($notification->data['transfer_id']) ? route('transfers.show', $notification->data['transfer_id']) : route('notifications.index')) }}" class="list-group-item list-group-item-action py-2 lh-sm">
+                                    <div class="d-flex w-100 align-items-center">
+                                        <div class="me-2">
+                                            <i class="bi bi-circle-fill text-primary" style="font-size: 0.5rem;"></i>
+                                        </div>
+                                        <div class="small w-100">
+                                            @if(isset($notification->data['status_type_name']))
+                                            <div class="text-muted">تحديث حالة عجلة</div>
+                                            <div>
+                                                {{ $notification->data['status_type_name'] ?? '' }}: 
+                                                {{ $notification->data['old_status'] ?? '' }} → {{ $notification->data['new_status'] ?? '' }}
+                                            </div>
+                                            @elseif(isset($notification->data['transfer_type']))
+                                            <div class="text-muted">{{ $notification->data['transfer_type'] ?? 'مناقلة' }}</div>
+                                            <div>
+                                                {{ $notification->data['vehicle_type'] ?? '' }} - {{ $notification->data['vehicle_number'] ?? '' }}
+                                            </div>
+                                            @else
+                                            <div>إشعار جديد</div>
+                                            @endif
+                                            <div class="text-muted mt-1">{{ $notification->created_at->diffForHumans() }}</div>
+                                        </div>
+                                    </div>
+                                </a>
+                                @empty
+                                <div class="list-group-item text-center text-muted py-3">لا توجد إشعارات جديدة</div>
+                                @endforelse
+                            </div>
+                        </div>
+                        <div class="card-footer text-center p-2 bg-light">
+                            <a href="{{ route('notifications.index') }}" class="text-decoration-none">عرض جميع الإشعارات</a>
+                        </div>
                     </div>
                 </div>
-            </li>
-            <li><hr class="dropdown-divider"></li>
-            @empty
-            <li><div class="dropdown-item text-center text-muted">لا توجد إشعارات جديدة</div></li>
-            @endforelse
-            <li>
-                <a class="dropdown-item text-center" href="{{ route('notifications.index') }}">
-                    عرض جميع الإشعارات
-                </a>
-            </li>
-        </ul>
-    </div>
-    @endauth
-</div>
-        <div class="navbar-nav">
-            <div class="nav-item text-nowrap">
+            </div>
+            @endauth
+                                                
+            <!-- اسم المستخدم -->
+            <div class="px-3 text-white d-none d-md-block">
+                @auth
+                {{ auth()->user()->name }}
+                @endauth
+            </div>
+                                                
+            <!-- زر تسجيل الخروج -->
+            <div>
                 @auth
                 <form action="{{ route('logout') }}" method="POST">
                     @csrf
-                    <button type="submit" class="nav-link px-3 bg-dark border-0">
+                    <button type="submit" class="nav-link px-3 bg-dark border-0 text-white">
                         <i class="bi bi-box-arrow-right"></i> تسجيل الخروج
                     </button>
                 </form>
@@ -7472,11 +7511,21 @@ import './bootstrap';
                         
                         @role('admin')
                         <li class="nav-item">
+                            <a class="nav-link {{ Request::routeIs('notifications.*') ? 'active' : '' }}" 
+                               href="{{ route('notifications.index') }}">
+                                <i class="bi bi-bell"></i> الإشعارات
+                                @if(auth()->user()->unreadNotifications()->count() > 0)
+                                <span class="badge bg-danger">{{ auth()->user()->unreadNotifications()->count() }}</span>
+                                @endif
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {{ Request::routeIs('users.*') ? 'active' : '' }}" 
                                href="{{ route('users.index') }}">
                                 <i class="bi bi-people"></i> إدارة المستخدمين
                             </a>
                         </li>
+
                         @endrole
                     </ul>
                 </div>
@@ -8855,7 +8904,7 @@ import './bootstrap';
                     <select name="type" id="type" class="form-select @error('type') is-invalid @enderror" required>
                         <option value="">-- اختر نوع السجل --</option>
                         <option value="confiscated" {{ old('type') == 'confiscated' ? 'selected' : '' }}>مصادرة</option>
-                        @if(isset($canAddGovernmentVehicle) && $canAddGovernmentVehicle)
+                        @if(auth()->user()->hasRole(['admin', 'verifier', 'vehicles_dept']))
                         <option value="government" {{ old('type') == 'government' ? 'selected' : '' }}>حكومية</option>
                         @endif
                     </select>
@@ -8864,7 +8913,7 @@ import './bootstrap';
                     @enderror
                 </div>
             </div>
-            
+
             <div class="col-md-6">
                 <div class="form-group">
                     <label for="directorate_id" class="form-label required-field">المديرية</label>
@@ -9947,11 +9996,11 @@ import './bootstrap';
 @section('title', 'العجلات')
 
 @section('actions')
-@can('create vehicles')
+@if(auth()->user()->can('create vehicles') || auth()->user()->hasRole('vehicles_dept'))
 <a href="{{ route('vehicles.create') }}" class="btn btn-primary">
     <i class="bi bi-plus-lg"></i> إضافة عجلة جديدة
 </a>
-@endcan
+@endif
 @endsection
 
 @section('content')
@@ -10108,11 +10157,11 @@ import './bootstrap';
            <h4>لا توجد عجلات متاحة</h4>
            <p class="text-muted">قم بإضافة عجلة جديدة أو تعديل معايير البحث</p>
            
-           @can('create vehicles')
-           <a href="{{ route('vehicles.create') }}" class="btn btn-primary mt-2">
-               <i class="bi bi-plus-lg"></i> إضافة عجلة جديدة
-           </a>
-           @endcan
+           @if(auth()->user()->can('create vehicles') || auth()->user()->hasRole('vehicles_dept'))
+            <a href="{{ route('vehicles.create') }}" class="btn btn-primary">
+                <i class="bi bi-plus-lg"></i> إضافة عجلة جديدة
+            </a>
+            @endif
        </div>
        @endif
    </div>
@@ -10562,11 +10611,13 @@ import './bootstrap';
                 @endif
                 
                 @if($vehicle->donation_status == 'مهداة')
-                @can('update vehicle status')
-                <button type="button" class="btn btn-primary mt-3 w-100" data-bs-toggle="modal" data-bs-target="#registrationStatusModal">
-                    <i class="bi bi-pencil-square"></i> تحديث حالة الترقيم الحكومي
-                </button>
-                @endcan
+                    @can('update vehicle status')
+                        @if(auth()->user()->hasRole(['admin', 'verifier', 'vehicles_dept']))
+                        <button type="button" class="btn btn-primary mt-3 w-100" data-bs-toggle="modal" data-bs-target="#registrationStatusModal">
+                            <i class="bi bi-pencil-square"></i> تحديث حالة الترقيم الحكومي
+                        </button>
+                        @endif
+                    @endcan
                 @endif
             </div>
         </div>
