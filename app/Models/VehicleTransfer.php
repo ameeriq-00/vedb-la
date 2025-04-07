@@ -4,10 +4,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class VehicleTransfer extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'vehicle_id',
@@ -97,15 +99,15 @@ class VehicleTransfer extends Model
         if ($this->is_ownership_transfer) {
             return 'نقل ملكية';
         }
-        
+
         if ($this->is_referral) {
             return 'إحالة خارجية';
         }
-        
+
         if ($this->return_date) {
             return 'مكتملة';
         }
-        
+
         return 'جارية';
     }
 
@@ -121,11 +123,11 @@ class VehicleTransfer extends Model
         if ($this->is_ownership_transfer) {
             return $this->attachments->where('type', 'ownership_transfer_document')->first();
         }
-        
+
         if ($this->is_referral) {
             return $this->attachments->where('type', 'external_referral_document')->first();
         }
-        
+
         return $this->attachments->where('type', 'transfer_document')->first();
     }
 
@@ -133,5 +135,38 @@ class VehicleTransfer extends Model
     public function getReturnDocument()
     {
         return $this->attachments->where('type', 'return_document')->first();
+    }
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logOnly(['vehicle_id', 'recipient_name', 'recipient_entity', 'receive_date', 'return_date', 'is_ownership_transfer', 'is_referral'])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    if ($this->is_ownership_transfer) {
+                        return 'تم نقل ملكية عجلة';
+                    } elseif ($this->is_referral) {
+                        return 'تمت إحالة عجلة خارجيًا';
+                    } else {
+                        return 'تمت مناقلة عجلة';
+                    }
+                } elseif ($eventName == 'updated' && !is_null($this->return_date)) {
+                    return 'تم إكمال مناقلة عجلة';
+                }
+
+                return 'تم ' . $this->getEventArabicName($eventName) . ' مناقلة عجلة';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
+    }
+
+    private function getEventArabicName(string $eventName): string
+    {
+        $events = [
+            'created' => 'إنشاء',
+            'updated' => 'تحديث',
+            'deleted' => 'حذف',
+        ];
+
+        return $events[$eventName] ?? $eventName;
     }
 }

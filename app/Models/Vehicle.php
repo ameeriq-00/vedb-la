@@ -4,10 +4,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class Vehicle extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'directorate_id',
@@ -140,7 +142,7 @@ class Vehicle extends Model
         if ($user->hasRole(['admin', 'verifier'])) {
             return $query; // Can see all vehicles
         }
-        
+
         if ($user->hasRole('vehicles_dept')) {
             // Vehicles department can see government vehicles and confiscated vehicles that have final degree or authenticated
             return $query->where(function($q) {
@@ -155,14 +157,14 @@ class Vehicle extends Model
                   });
             });
         }
-        
+
         if ($user->hasRole('recipient')) {
             // Recipients can only see vehicles transferred to their directorate
             return $query->whereHas('transfers', function($q) use ($user) {
                 $q->where('destination_directorate_id', $user->directorate_id);
             });
         }
-        
+
         // Default for data entry - only see their directorate's vehicles
         return $query->where('directorate_id', $user->directorate_id);
     }
@@ -173,25 +175,25 @@ class Vehicle extends Model
         switch ($stage) {
             case 'final_degree':
                 return $this->type === 'confiscated' && $this->seizure_status === 'مصادرة';
-            
+
             case 'valuation':
                 return $this->type === 'confiscated' && $this->final_degree_status === 'مكتسبة';
-            
+
             case 'authentication':
                 return $this->type === 'confiscated' && $this->valuation_status === 'مثمنة';
-            
+
             case 'donation':
                 return $this->type === 'confiscated' && $this->authentication_status === 'تمت المصادقة عليها';
-            
+
             case 'government_registration':
                 return $this->type === 'confiscated' && $this->donation_status === 'مهداة';
-            
+
             case 'transfer':
-                return ($this->type === 'government') || 
-                       ($this->type === 'confiscated' && 
-                        ($this->final_degree_status === 'مكتسبة' || 
+                return ($this->type === 'government') ||
+                       ($this->type === 'confiscated' &&
+                        ($this->final_degree_status === 'مكتسبة' ||
                          $this->authentication_status === 'تمت المصادقة عليها'));
-            
+
             default:
                 return false;
         }
@@ -231,43 +233,43 @@ class Vehicle extends Model
         if ($this->type === 'government') {
             return 'government';
         }
-        
+
         if ($this->type === 'confiscated') {
             if ($this->is_externally_referred) {
                 return 'externally_referred';
             }
-            
+
             if ($this->government_registration_status === 'مرقمة') {
                 return 'registered';
             }
-            
+
             if ($this->donation_status === 'مهداة') {
                 return 'donated';
             }
-            
+
             if ($this->authentication_status === 'تمت المصادقة عليها') {
                 return 'authenticated';
             }
-            
+
             if ($this->valuation_status === 'مثمنة') {
                 return 'valued';
             }
-            
+
             if ($this->final_degree_status === 'مكتسبة') {
                 return 'final_degree';
             }
-            
+
             if ($this->seizure_status === 'مصادرة') {
                 return 'confiscated';
             }
-            
+
             if ($this->seizure_status === 'مفرج عنها') {
                 return 'released';
             }
-            
+
             return 'seized';
         }
-        
+
         return 'unknown';
     }
 
@@ -278,7 +280,7 @@ class Vehicle extends Model
         if ($this->is_externally_referred) {
             return false;
         }
-        
+
         return $this->canProceedToStage('transfer');
     }
 
@@ -289,17 +291,17 @@ class Vehicle extends Model
         if ($user->hasRole(['admin', 'verifier'])) {
             return true;
         }
-        
+
         // Data entry can only update vehicles in their directorate
         if ($user->hasRole('data_entry') && $this->directorate_id === $user->directorate_id) {
             return true;
         }
-        
+
         // Vehicles department can update vehicles in the final stages
         if ($user->hasRole('vehicles_dept') && $this->isTransferable()) {
             return true;
         }
-        
+
         return false;
     }
 
@@ -311,18 +313,61 @@ class Vehicle extends Model
             ->orderBy('created_at', 'desc')
             ->get();
     }
-    
+
     // Get all attachments from statuses
     public function getAllStatusAttachments()
     {
         $statusIds = $this->statuses->pluck('id')->toArray();
-        
+
         if (empty($statusIds)) {
             return collect([]);
         }
-        
+
         return Attachment::where('attachable_type', 'App\Models\VehicleStatus')
             ->whereIn('attachable_id', $statusIds)
             ->get();
+    }
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logOnly([
+                'type', 'vehicle_type', 'vehicle_name', 'vehicle_number',
+                'seizure_status', 'final_degree_status', 'valuation_status',
+                'authentication_status', 'donation_status', 'government_registration_status'
+            ])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    return 'تمت إضافة عجلة جديدة';
+                }
+                if ($eventName == 'updated') {
+                    // تحديد ما إذا كان التحديث لحالة
+                    $dirtyAttributes = $this->getDirty();
+                    foreach (['seizure_status', 'final_degree_status', 'valuation_status', 'authentication_status', 'donation_status', 'government_registration_status'] as $statusField) {
+                        if (array_key_exists($statusField, $dirtyAttributes)) {
+                            $statusName = $this->getStatusTypeName($statusField);
+                            $oldValue = $this->getOriginal($statusField);
+                            $newValue = $dirtyAttributes[$statusField];
+                            return "تم تحديث {$statusName} من {$oldValue} إلى {$newValue}";
+                        }
+                    }
+                    return 'تم تحديث بيانات العجلة';
+                }
+                return 'تم ' . $this->getEventArabicName($eventName) . ' العجلة';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
+    }
+
+    private function getStatusTypeName($statusField): string
+    {
+        $statusTypes = [
+            'seizure_status' => 'حالة المصادرة',
+            'final_degree_status' => 'الدرجة القطعية',
+            'valuation_status' => 'حالة التثمين',
+            'authentication_status' => 'المصادقة',
+            'donation_status' => 'الإهداء',
+            'government_registration_status' => 'الترقيم الحكومي',
+        ];
+        return $statusTypes[$statusField] ?? $statusField;
     }
 }

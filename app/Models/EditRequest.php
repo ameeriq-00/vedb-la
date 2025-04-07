@@ -4,10 +4,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class EditRequest extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'vehicle_id',
@@ -43,5 +45,36 @@ class EditRequest extends Model
     public function attachments()
     {
         return $this->morphMany(Attachment::class, 'attachable');
+    }
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logOnly(['vehicle_id', 'field_name', 'old_value', 'new_value', 'status'])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    return 'تم إنشاء طلب تعديل جديد';
+                } elseif ($eventName == 'updated' && $this->isDirty('status')) {
+                    if ($this->status == 'approved') {
+                        return 'تمت الموافقة على طلب تعديل';
+                    } elseif ($this->status == 'rejected') {
+                        return 'تم رفض طلب تعديل';
+                    }
+                }
+
+                return 'تم ' . $this->getEventArabicName($eventName) . ' طلب تعديل';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
+    }
+
+    private function getEventArabicName(string $eventName): string
+    {
+        $events = [
+            'created' => 'إنشاء',
+            'updated' => 'تحديث',
+            'deleted' => 'حذف',
+        ];
+
+        return $events[$eventName] ?? $eventName;
     }
 }

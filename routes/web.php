@@ -30,10 +30,10 @@ Route::post('logout', [App\Http\Controllers\Auth\LoginController::class, 'logout
 Route::middleware(['auth'])->group(function () {
     // Dashboard
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
-    
+
     // Vehicles
     Route::resource('vehicles', VehicleController::class);
-    
+
     // Vehicle Status Updates
     Route::post('/vehicles/{vehicle}/update-seizure-status', [VehicleStatusController::class, 'updateSeizureStatus'])
         ->name('vehicles.update-seizure-status');
@@ -47,14 +47,14 @@ Route::middleware(['auth'])->group(function () {
         ->name('vehicles.update-donation-status');
     Route::post('/vehicles/{vehicle}/update-registration-status', [VehicleStatusController::class, 'updateRegistrationStatus'])
         ->name('vehicles.update-registration-status');
-    
+
     // Transfers
     Route::get('/transfers', [VehicleTransferController::class, 'index'])->name('transfers.index');
     Route::get('/vehicles/{vehicle}/transfers/create', [VehicleTransferController::class, 'create'])->name('transfers.create');
     Route::post('/vehicles/{vehicle}/transfers', [VehicleTransferController::class, 'store'])->name('transfers.store');
     Route::get('/transfers/{transfer}', [VehicleTransferController::class, 'show'])->name('transfers.show');
     Route::post('/transfers/{transfer}/complete', [VehicleTransferController::class, 'completeTransfer'])->name('transfers.complete');
-    
+
     // Edit Requests
     Route::get('/edit-requests', [EditRequestController::class, 'index'])->name('edit-requests.index');
     Route::get('/vehicles/{vehicle}/edit-requests/{field}/create', [EditRequestController::class, 'create'])->name('edit-requests.create');
@@ -62,41 +62,45 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/edit-requests/{editRequest}', [EditRequestController::class, 'show'])->name('edit-requests.show');
     Route::post('/edit-requests/{editRequest}/approve', [EditRequestController::class, 'approve'])->name('edit-requests.approve');
     Route::post('/edit-requests/{editRequest}/reject', [EditRequestController::class, 'reject'])->name('edit-requests.reject');
-    
+
     // Attachments
     Route::get('/attachments/{attachment}', [AttachmentController::class, 'show'])->name('attachments.show');
     Route::get('/attachments/{attachment}/download', [AttachmentController::class, 'download'])->name('attachments.download');
     Route::delete('/attachments/{attachment}', [AttachmentController::class, 'destroy'])->name('attachments.destroy');
-    
+
     // Users (admin only)
     Route::resource('users', UserController::class)->middleware('role:admin');
 
     // Vehicle ownership transfer and external referral routes
     Route::post('/vehicles/{vehicle}/transfer-ownership', [VehicleTransferController::class, 'transferOwnership'])
     ->name('vehicles.transfer-ownership');
-    
+
     Route::post('/vehicles/{vehicle}/external-referral', [VehicleTransferController::class, 'externalReferral'])
     ->name('vehicles.external-referral');
-    
+
     // Notifications
     Route::get('/notifications', [NotificationController::class, 'index'])->name('notifications.index');
     Route::post('/notifications/{id}/mark-as-read', [NotificationController::class, 'markAsRead'])->name('notifications.mark-as-read');
     Route::post('/notifications/mark-all-as-read', [NotificationController::class, 'markAllAsRead'])->name('notifications.mark-all-as-read');
+    Route::delete('/notifications/{id}', [NotificationController::class, 'destroy'])->name('notifications.destroy');
+    Route::delete('/notifications', [NotificationController::class, 'destroyAll'])->name('notifications.destroy-all');
+
+    Route::get('/vehicles/stalled', [VehicleController::class, 'stalled'])->name('vehicles.stalled')->middleware(['auth', 'role:admin']);
 
     Route::get('/api/check-recipient', function(Request $request) {
         $idNumber = $request->input('id_number');
         if (!$idNumber) {
             return response()->json(['count' => 0]);
         }
-        
+
         $count = VehicleTransfer::whereNull('return_date')
             ->where('recipient_id_number', $idNumber)
             ->where('is_ownership_transfer', false)
             ->where('is_referral', false)
             ->count();
-        
+
         return response()->json(['count' => $count]);
     })->middleware('auth')->name('api.check-recipient');
-    
+
 
 });

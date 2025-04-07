@@ -61,19 +61,21 @@ app/Models/User.php
 app/Models/Vehicle.php
 app/Models/VehicleStatus.php
 app/Models/VehicleTransfer.php
-app/Notifications/VehicleStatusUpdated.php
-app/Notifications/VehicleTransferred.php
+app/Notifications/DatabaseNotification.php
 app/Policies/EditRequestPolicy.php
 app/Policies/VehiclePolicy.php
 app/Policies/VehicleTransferPolicy.php
 app/Providers/AppServiceProvider.php
 app/Providers/AuthServiceProvider.php
+app/Providers/NotificationServiceProvider.php
 app/Providers/PermissionServiceProvider.php
+app/Services/NotificationService.php
 artisan
 bootstrap/app.php
 bootstrap/cache/.gitignore
 bootstrap/providers.php
 composer.json
+config/activitylog.php
 config/app.php
 config/auth.php
 config/cache.php
@@ -105,6 +107,11 @@ database/migrations/2025_03_22_163505_add_new_fields_to_vehicles_table.php
 database/migrations/2025_03_22_163549_add_recipient_id_to_vehicle_transfers_table.php.php
 database/migrations/2025_03_22_163619_create_notifications_table.php
 database/migrations/2025_03_22_172047_add_transfer_types_to_vehicle_transfers_table.php
+database/migrations/2025_04_06_213518_create_activity_log_table.php
+database/migrations/2025_04_06_213545_add_event_column_to_activity_log_table.php
+database/migrations/2025_04_06_213546_add_batch_uuid_column_to_activity_log_table.php
+database/migrations/2025_04_06_214204_drop_activity_log_table.php
+database/migrations/2025_04_06_214217_create_activity_log_table_new.php
 database/seeders/DatabaseSeeder.php
 database/seeders/DirectoratesSeeder.php
 database/seeders/RolesAndPermissionsSeeder.php
@@ -131,6 +138,7 @@ resources/views/vehicles/create.blade.php
 resources/views/vehicles/edit.blade.php
 resources/views/vehicles/index.blade.php
 resources/views/vehicles/show.blade.php
+resources/views/vehicles/stalled.blade.php
 routes/auth.php
 routes/console.php
 routes/web.php
@@ -139,6 +147,748 @@ storage/framework/.gitignore
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="app/Notifications/DatabaseNotification.php">
+<?php
+
+namespace App\Notifications;
+
+use Illuminate\Bus\Queueable;
+use Illuminate\Notifications\Notification;
+
+class DatabaseNotification extends Notification
+{
+    use Queueable;
+
+    protected $data;
+
+    /**
+     * Create a new notification instance.
+     *
+     * @param array $data
+     */
+    public function __construct(array $data)
+    {
+        $this->data = $data;
+    }
+
+    /**
+     * Get the notification's delivery channels.
+     *
+     * @param  mixed  $notifiable
+     * @return array
+     */
+    public function via($notifiable)
+    {
+        return ['database'];
+    }
+
+    /**
+     * Get the array representation of the notification.
+     *
+     * @param  mixed  $notifiable
+     * @return array
+     */
+    public function toArray($notifiable)
+    {
+        return $this->data;
+    }
+}
+</file>
+
+<file path="app/Providers/NotificationServiceProvider.php">
+<?php
+
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+use App\Services\NotificationService;
+use Spatie\Activitylog\Models\Activity;
+
+class NotificationServiceProvider extends ServiceProvider
+{
+    /**
+     * Register services.
+     *
+     * @return void
+     */
+    public function register()
+    {
+        $this->app->singleton(NotificationService::class, function ($app) {
+            return new NotificationService();
+        });
+    }
+
+    /**
+     * Bootstrap services.
+     *
+     * @return void
+     */
+    public function boot()
+    {
+        // Listen for created events on the Activity model
+        Activity::created(function (Activity $activity) {
+            app(NotificationService::class)->processActivity($activity);
+        });
+    }
+}
+</file>
+
+<file path="app/Services/NotificationService.php">
+<?php
+
+namespace App\Services;
+
+use App\Models\User;
+use App\Notifications\DatabaseNotification;
+use Illuminate\Support\Facades\Notification;
+use Spatie\Activitylog\Models\Activity;
+
+class NotificationService
+{
+    /**
+     * Process activity and send notifications
+     *
+     * @param Activity $activity
+     * @return void
+     */
+    public function processActivity(Activity $activity)
+    {
+        $subject = $activity->subject;
+
+        // لا نرسل إشعارات إذا كان الكائن غير موجود
+        if (!$subject) {
+            return;
+        }
+
+        // Determine which type of activity this is
+        if ($subject instanceof \App\Models\Vehicle) {
+            $this->processVehicleActivity($activity, $subject);
+        } elseif ($subject instanceof \App\Models\VehicleTransfer) {
+            $this->processTransferActivity($activity, $subject);
+        } elseif ($subject instanceof \App\Models\EditRequest) {
+            $this->processEditRequestActivity($activity, $subject);
+        }
+    }
+
+    /**
+     * Process Vehicle related activity
+     */
+    protected function processVehicleActivity(Activity $activity, $vehicle)
+    {
+        $eventName = $activity->event;
+        $usersToNotify = $this->getRelevantUsers($vehicle, $eventName);
+    
+        // استخدم الوصف المحدد مباشرة من النشاط
+        $description = $activity->description;
+    
+        // حدد الرسالة بناءً على نوع الحدث
+        $message = '';
+        if ($eventName == 'created') {
+            $typeText = $vehicle->type == 'confiscated' ? 'مصادرة' : 'حكومية';
+            $message = 'تمت إضافة عجلة ' . $typeText . ' جديدة نوع ' . $vehicle->vehicle_type;
+            if ($vehicle->vehicle_number) {
+                $message .= ' رقم ' . $vehicle->vehicle_number;
+            }
+        } elseif ($eventName == 'updated') {
+            // Check for status changes
+            if (!empty($activity->properties['attributes']) && !empty($activity->properties['old'])) {
+                foreach ($activity->properties['attributes'] as $key => $newValue) {
+                    if (in_array($key, ['seizure_status', 'final_degree_status', 'valuation_status', 'authentication_status', 'donation_status', 'government_registration_status'])
+                        && isset($activity->properties['old'][$key])
+                        && $activity->properties['old'][$key] != $newValue) {
+                        
+                        $message = 'تم تغيير ' . $this->getStatusTypeName($key) . ' للعجلة ' . $vehicle->vehicle_type;
+                        if ($vehicle->vehicle_number) {
+                            $message .= ' رقم ' . $vehicle->vehicle_number;
+                        }
+                        $message .= ' من ' . $activity->properties['old'][$key] . ' إلى ' . $newValue;
+                        break;
+                    }
+                }
+            }
+        
+            // If no specific status message was set
+            if (empty($message)) {
+                $message = 'تم تحديث بيانات العجلة ' . $vehicle->vehicle_type;
+                if ($vehicle->vehicle_number) {
+                    $message .= ' رقم ' . $vehicle->vehicle_number;
+                }
+            }
+        }
+    
+        $notificationData = [
+            'title' => $description,
+            'message' => $message,
+            'icon' => 'bi bi-truck',
+            'vehicle_id' => $vehicle->id,
+            'vehicle_type' => $vehicle->vehicle_type,
+            'vehicle_number' => $vehicle->vehicle_number,
+            'vehicle_name' => $vehicle->vehicle_name,
+            'action_url' => route('vehicles.show', $vehicle->id),
+            'causer_id' => $activity->causer_id,
+            'causer_name' => $activity->causer ? $activity->causer->name : 'النظام',
+            'created_at' => $activity->created_at
+        ];
+    
+        // Add properties for status changes
+        if ($eventName == 'updated' && !empty($activity->properties['attributes']) && !empty($activity->properties['old'])) {
+            foreach ($activity->properties['attributes'] as $key => $newValue) {
+                if (in_array($key, ['seizure_status', 'final_degree_status', 'valuation_status', 'authentication_status', 'donation_status', 'government_registration_status'])
+                    && isset($activity->properties['old'][$key])
+                    && $activity->properties['old'][$key] != $newValue) {
+                    
+                    $notificationData['status_type'] = $key;
+                    $notificationData['status_type_name'] = $this->getStatusTypeName($key);
+                    $notificationData['old_status'] = $activity->properties['old'][$key];
+                    $notificationData['new_status'] = $newValue;
+                    break;
+                }
+            }
+        }
+    
+        Notification::send($usersToNotify, new DatabaseNotification($notificationData));
+    }
+
+    /**
+     * Process VehicleTransfer related activity
+     */
+    protected function processTransferActivity(Activity $activity, $transfer)
+    {
+        $eventName = $activity->event;
+        $usersToNotify = $this->getRelevantUsers($transfer, $eventName);
+
+        // استخدم الوصف المحدد مباشرة من النشاط
+        $description = $activity->description;
+
+        // Determine transfer type
+        $transferType = '';
+        if ($transfer->is_ownership_transfer) {
+            $transferType = 'نقل ملكية';
+        } elseif ($transfer->is_referral) {
+            $transferType = 'إحالة خارجية';
+        } else {
+            $transferType = 'مناقلة';
+        }
+
+        // بناء الرسالة بناء على نوع الحدث
+        $message = '';
+        if ($eventName == 'created') {
+            if ($transfer->is_ownership_transfer) {
+                $message = 'تم نقل ملكية العجلة ' . $transfer->vehicle->vehicle_type;
+            } elseif ($transfer->is_referral) {
+                $message = 'تمت إحالة العجلة ' . $transfer->vehicle->vehicle_type . ' خارجيًا';
+            } else {
+                $message = 'تمت مناقلة العجلة ' . $transfer->vehicle->vehicle_type;
+            }
+
+            if ($transfer->vehicle->vehicle_number) {
+                $message .= ' رقم ' . $transfer->vehicle->vehicle_number;
+            }
+
+            $message .= ' إلى ' . $transfer->recipient_entity;
+        }
+        elseif ($eventName == 'updated' && isset($activity->properties['attributes']['return_date']) && !is_null($activity->properties['attributes']['return_date'])) {
+            $message = 'تم إكمال مناقلة العجلة ' . $transfer->vehicle->vehicle_type;
+            if ($transfer->vehicle->vehicle_number) {
+                $message .= ' رقم ' . $transfer->vehicle->vehicle_number;
+            }
+        }
+
+        $notificationData = [
+            'title' => $description,
+            'message' => $message,
+            'icon' => 'bi bi-arrow-left-right',
+            'transfer_id' => $transfer->id,
+            'vehicle_id' => $transfer->vehicle->id,
+            'vehicle_type' => $transfer->vehicle->vehicle_type,
+            'vehicle_number' => $transfer->vehicle->vehicle_number,
+            'recipient_name' => $transfer->recipient_name,
+            'recipient_entity' => $transfer->recipient_entity,
+            'transfer_type' => $transferType,
+            'transfer_date' => $transfer->receive_date->format('Y-m-d'),
+            'action_url' => route('transfers.show', $transfer->id),
+            'causer_id' => $activity->causer_id,
+            'causer_name' => $activity->causer ? $activity->causer->name : 'النظام',
+            'created_at' => $activity->created_at
+        ];
+
+        if ($eventName == 'updated' && isset($activity->properties['attributes']['return_date']) && !is_null($activity->properties['attributes']['return_date'])) {
+            $notificationData['return_date'] = $transfer->return_date->format('Y-m-d');
+        }
+
+        Notification::send($usersToNotify, new DatabaseNotification($notificationData));
+    }
+
+    /**
+     * Process EditRequest related activity
+     */
+    protected function processEditRequestActivity(Activity $activity, $editRequest)
+    {
+        $eventName = $activity->event;
+        $usersToNotify = $this->getRelevantUsers($editRequest, $eventName);
+
+        // استخدم الوصف المحدد مباشرة من النشاط
+        $description = $activity->description;
+
+        // بناء الرسالة بناء على نوع الحدث
+        $message = '';
+        if ($eventName == 'created') {
+            $message = 'تم إنشاء طلب لتعديل حقل ' . $editRequest->field_name . ' للعجلة ' . $editRequest->vehicle->vehicle_type;
+            if ($editRequest->vehicle->vehicle_number) {
+                $message .= ' رقم ' . $editRequest->vehicle->vehicle_number;
+            }
+        }
+        elseif ($eventName == 'updated' &&
+                isset($activity->properties['attributes']['status']) &&
+                $activity->properties['attributes']['status'] != 'pending') {
+
+            if ($activity->properties['attributes']['status'] == 'approved') {
+                $message = 'تمت الموافقة على طلب تعديل حقل ' . $editRequest->field_name . ' للعجلة ' . $editRequest->vehicle->vehicle_type;
+            } else {
+                $message = 'تم رفض طلب تعديل حقل ' . $editRequest->field_name . ' للعجلة ' . $editRequest->vehicle->vehicle_type;
+            }
+
+            if ($editRequest->vehicle->vehicle_number) {
+                $message .= ' رقم ' . $editRequest->vehicle->vehicle_number;
+            }
+        }
+
+        $notificationData = [
+            'title' => $description,
+            'message' => $message,
+            'icon' => 'bi bi-pencil-square',
+            'edit_request_id' => $editRequest->id,
+            'vehicle_id' => $editRequest->vehicle_id,
+            'vehicle_type' => $editRequest->vehicle->vehicle_type,
+            'vehicle_name' => $editRequest->vehicle->vehicle_name,
+            'vehicle_number' => $editRequest->vehicle->vehicle_number,
+            'field_name' => $editRequest->field_name,
+            'old_value' => $editRequest->old_value,
+            'new_value' => $editRequest->new_value,
+            'status' => $editRequest->status,
+            'action_url' => route('edit-requests.show', $editRequest->id),
+            'causer_id' => $activity->causer_id,
+            'causer_name' => $activity->causer ? $activity->causer->name : 'النظام',
+            'created_at' => $activity->created_at
+        ];
+
+        Notification::send($usersToNotify, new DatabaseNotification($notificationData));
+    }
+
+    /**
+     * Get users who should be notified based on the entity and event
+     */
+    protected function getRelevantUsers($entity, $eventName)
+    {
+        $usersToNotify = [];
+
+        // Always notify admins and verifiers
+        $adminUsers = User::role(['admin', 'verifier'])->get();
+        $adminUserIds = $adminUsers->pluck('id')->toArray();
+
+        foreach ($adminUsers as $adminUser) {
+            $usersToNotify[] = $adminUser;
+        }
+
+        if ($entity instanceof \App\Models\Vehicle) {
+            // If it's a vehicle, also notify users from the same directorate
+            if ($entity->directorate) {
+                $directoryUsers = User::where('directorate_id', $entity->directorate_id)
+                                    ->whereNotIn('id', $adminUserIds)
+                                    ->get();
+                foreach ($directoryUsers as $dirUser) {
+                    $usersToNotify[] = $dirUser;
+                }
+            }
+
+            // For certain statuses, notify the vehicles department
+            if ($eventName == 'updated' &&
+                ($entity->final_degree_status == 'مكتسبة' ||
+                 $entity->authentication_status == 'تمت المصادقة عليها')) {
+
+                $vehiclesDeptUsers = User::role('vehicles_dept')
+                                        ->whereNotIn('id', collect($usersToNotify)->pluck('id')->toArray())
+                                        ->get();
+                foreach ($vehiclesDeptUsers as $vdUser) {
+                    $usersToNotify[] = $vdUser;
+                }
+            }
+        }
+        elseif ($entity instanceof \App\Models\VehicleTransfer) {
+            // For transfers, notify vehicles dept
+            $vehiclesDeptUsers = User::role('vehicles_dept')
+                                    ->whereNotIn('id', $adminUserIds)
+                                    ->get();
+            foreach ($vehiclesDeptUsers as $vdUser) {
+                $usersToNotify[] = $vdUser;
+            }
+
+            // If it's a transfer to a directorate, notify recipients from that directorate
+            if ($entity->destination_directorate_id) {
+                $recipientUsers = User::role('recipient')
+                    ->where('directorate_id', $entity->destination_directorate_id)
+                    ->whereNotIn('id', collect($usersToNotify)->pluck('id')->toArray())
+                    ->get();
+                foreach ($recipientUsers as $recipientUser) {
+                    $usersToNotify[] = $recipientUser;
+                }
+            }
+        }
+        elseif ($entity instanceof \App\Models\EditRequest) {
+            // For edit requests, only notify the requester and admins/verifiers
+            if ($eventName == 'updated' && $entity->user_id && !in_array($entity->user_id, collect($usersToNotify)->pluck('id')->toArray())) {
+                $requester = User::find($entity->user_id);
+                if ($requester) {
+                    $usersToNotify[] = $requester;
+                }
+            }
+        }
+
+        // Remove duplicates and return
+        return collect($usersToNotify)->unique('id')->values()->all();
+    }
+
+    /**
+     * Get the status type name in Arabic.
+     */
+    private function getStatusTypeName($statusType)
+    {
+        $statusTypes = [
+            'seizure_status' => 'حالة المصادرة',
+            'final_degree_status' => 'الدرجة القطعية',
+            'valuation_status' => 'حالة التثمين',
+            'authentication_status' => 'المصادقة',
+            'donation_status' => 'الإهداء',
+            'government_registration_status' => 'الترقيم الحكومي',
+        ];
+
+        return $statusTypes[$statusType] ?? $statusType;
+    }
+}
+</file>
+
+<file path="config/activitylog.php">
+<?php
+
+return [
+
+    /*
+     * If set to false, no activities will be saved to the database.
+     */
+    'enabled' => env('ACTIVITY_LOGGER_ENABLED', true),
+
+    /*
+     * When the clean-command is executed, all recording activities older than
+     * the number of days specified here will be deleted.
+     */
+    'delete_records_older_than_days' => 365,
+
+    /*
+     * If no log name is passed to the activity() helper
+     * we use this default log name.
+     */
+    'default_log_name' => 'default',
+
+    /*
+     * You can specify an auth driver here that gets user models.
+     * If this is null we'll use the current Laravel auth driver.
+     */
+    'default_auth_driver' => null,
+
+    /*
+     * If set to true, the subject returns soft deleted models.
+     */
+    'subject_returns_soft_deleted_models' => false,
+
+    /*
+     * This model will be used to log activity.
+     * It should implement the Spatie\Activitylog\Contracts\Activity interface
+     * and extend Illuminate\Database\Eloquent\Model.
+     */
+    'activity_model' => \Spatie\Activitylog\Models\Activity::class,
+
+    /*
+     * This is the name of the table that will be created by the migration and
+     * used by the Activity model shipped with this package.
+     */
+    'table_name' => env('ACTIVITY_LOGGER_TABLE_NAME', 'activity_log'),
+
+    /*
+     * This is the database connection that will be used by the migration and
+     * the Activity model shipped with this package. In case it's not set
+     * Laravel's database.default will be used instead.
+     */
+    'database_connection' => env('ACTIVITY_LOGGER_DB_CONNECTION'),
+];
+</file>
+
+<file path="database/migrations/2025_04_06_213518_create_activity_log_table.php">
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('activity_log', function (Blueprint $table) {
+            $table->bigIncrements('id');
+            $table->string('log_name')->nullable();
+            $table->text('description');
+            $table->nullableMorphs('subject', 'subject');
+            $table->nullableMorphs('causer', 'causer');
+            $table->json('properties')->nullable();
+            $table->uuid('batch_uuid')->nullable();
+            $table->timestamps();
+            $table->index('log_name');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('activity_log');
+    }
+};
+</file>
+
+<file path="database/migrations/2025_04_06_213545_add_event_column_to_activity_log_table.php">
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        if (Schema::hasTable('activity_log') && !Schema::hasColumn('activity_log', 'event')) {
+            Schema::table('activity_log', function (Blueprint $table) {
+                $table->string('event')->nullable()->after('log_name');
+            });
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        if (Schema::hasTable('activity_log') && Schema::hasColumn('activity_log', 'event')) {
+            Schema::table('activity_log', function (Blueprint $table) {
+                $table->dropColumn('event');
+            });
+        }
+    }
+};
+</file>
+
+<file path="database/migrations/2025_04_06_213546_add_batch_uuid_column_to_activity_log_table.php">
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        if (Schema::hasTable('activity_log') && !Schema::hasColumn('activity_log', 'batch_uuid')) {
+            Schema::table('activity_log', function (Blueprint $table) {
+                $table->uuid('batch_uuid')->nullable()->after('properties');
+            });
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        if (Schema::hasTable('activity_log') && Schema::hasColumn('activity_log', 'batch_uuid')) {
+            Schema::table('activity_log', function (Blueprint $table) {
+                $table->dropColumn('batch_uuid');
+            });
+        }
+    }
+};
+</file>
+
+<file path="database/migrations/2025_04_06_214204_drop_activity_log_table.php">
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::dropIfExists('activity_log');
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        // ترك هذا فارغًا لأنه سيتم إنشاء الجدول في الخطوة التالية
+    }
+};
+</file>
+
+<file path="database/migrations/2025_04_06_214217_create_activity_log_table_new.php">
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('activity_log', function (Blueprint $table) {
+            $table->bigIncrements('id');
+            $table->string('log_name')->nullable();
+            $table->string('event')->nullable();
+            $table->text('description');
+            $table->nullableMorphs('subject', 'subject');
+            $table->nullableMorphs('causer', 'causer');
+            $table->json('properties')->nullable();
+            $table->uuid('batch_uuid')->nullable();
+            $table->timestamps();
+            $table->index('log_name');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('activity_log');
+    }
+};
+</file>
+
+<file path="resources/views/vehicles/stalled.blade.php">
+@extends('layouts.app')
+
+@section('title', 'العجلات المتوقفة')
+
+@section('content')
+<div class="card mb-4">
+    <div class="card-header">
+        <h5 class="mb-0">العجلات المتوقفة منذ شهرين أو أكثر</h5>
+    </div>
+    <div class="card-body">
+        <ul class="nav nav-tabs mb-3" id="stalledTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="seized-tab" data-bs-toggle="tab" data-bs-target="#seized" type="button" role="tab" aria-controls="seized" aria-selected="true">
+                    محجوزة ({{ count($stalledVehicles['seizure']) }})
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="confiscated-tab" data-bs-toggle="tab" data-bs-target="#confiscated" type="button" role="tab" aria-controls="confiscated" aria-selected="false">
+                    مصادرة ({{ count($stalledVehicles['confiscation']) }})
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="final-degree-tab" data-bs-toggle="tab" data-bs-target="#final-degree" type="button" role="tab" aria-controls="final-degree" aria-selected="false">
+                    مكتسبة ({{ count($stalledVehicles['final_degree']) }})
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="valuation-tab" data-bs-toggle="tab" data-bs-target="#valuation" type="button" role="tab" aria-controls="valuation" aria-selected="false">
+                    مثمنة ({{ count($stalledVehicles['valuation']) }})
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="authentication-tab" data-bs-toggle="tab" data-bs-target="#authentication" type="button" role="tab" aria-controls="authentication" aria-selected="false">
+                    مصادق عليها ({{ count($stalledVehicles['authentication']) }})
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="donation-tab" data-bs-toggle="tab" data-bs-target="#donation" type="button" role="tab" aria-controls="donation" aria-selected="false">
+                    مهداة ({{ count($stalledVehicles['donation']) }})
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content" id="stalledTabContent">
+            @foreach(['seizure' => 'محجوزة', 'confiscation' => 'مصادرة', 'final_degree' => 'مكتسبة', 'valuation' => 'مثمنة', 'authentication' => 'مصادق عليها', 'donation' => 'مهداة'] as $key => $label)
+                <div class="tab-pane fade {{ $key == 'seizure' ? 'show active' : '' }}" id="{{ $key == 'seizure' ? 'seized' : $key }}" role="tabpanel" aria-labelledby="{{ $key == 'seizure' ? 'seized' : $key }}-tab">
+                    @if(count($stalledVehicles[$key]) > 0)
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>#</th>
+                                        <th>النوع</th>
+                                        <th>الرقم</th>
+                                        <th>المديرية</th>
+                                        <th>تاريخ آخر تحديث</th>
+                                        <th>المتهم</th>
+                                        <th>المدة المتوقفة</th>
+                                        <th>الإجراءات</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach($stalledVehicles[$key] as $vehicle)
+                                    <tr>
+                                        <td>{{ $vehicle->id }}</td>
+                                        <td>{{ $vehicle->vehicle_type }}</td>
+                                        <td>{{ $vehicle->vehicle_number ?: 'بلا رقم' }}</td>
+                                        <td>{{ $vehicle->directorate->name }}</td>
+                                        <td>{{ $vehicle->updated_at->format('Y-m-d') }}</td>
+                                        <td>{{ $vehicle->defendant_name }}</td>
+                                        <td>{{ $vehicle->updated_at->diffForHumans(['parts' => 2]) }}</td>
+                                        <td>
+                                            <a href="{{ route('vehicles.show', $vehicle) }}" class="btn btn-sm btn-primary">
+                                                <i class="bi bi-eye"></i> عرض
+                                            </a>
+                                        </td>
+                                    </tr>
+                                    @endforeach
+                                </tbody>
+                            </table>
+                        </div>
+                    @else
+                        <div class="alert alert-info">
+                            لا توجد عجلات متوقفة في حالة {{ $label }}
+                        </div>
+                    @endif
+                </div>
+            @endforeach
+        </div>
+    </div>
+</div>
+@endsection
+</file>
 
 <file path=".gitignore">
 # Laravel specific
@@ -247,7 +997,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Response;
 use Illuminate\Support\Facades\Auth;
-
 class AttachmentController extends Controller
 {
     public function __construct()
@@ -261,38 +1010,38 @@ class AttachmentController extends Controller
         if (!$this->canAccessAttachment($attachment)) {
             abort(403, 'غير مصرح لك بعرض هذا المرفق.');
         }
-        
+
         $path = storage_path('app/public/' . $attachment->file_path);
-        
+
         if (!file_exists($path)) {
             abort(404, 'المرفق غير موجود.');
         }
-        
+
         $content = file_get_contents($path);
         $type = $attachment->file_type;
-        
+
         return Response::make($content, 200, [
             'Content-Type' => $type,
             'Content-Disposition' => 'inline; filename="' . $attachment->file_name . '"'
         ]);
     }
-    
+
     public function download(Attachment $attachment)
     {
         // Check if user has permission to download this attachment
         if (!$this->canAccessAttachment($attachment)) {
             abort(403, 'غير مصرح لك بتنزيل هذا المرفق.');
         }
-        
+
         $path = storage_path('app/public/' . $attachment->file_path);
-        
+
         if (!file_exists($path)) {
             abort(404, 'المرفق غير موجود.');
         }
-        
+
         return response()->download($path, $attachment->file_name);
     }
-    
+
     public function destroy(Attachment $attachment)
     {
         // Check if user has permission to delete this attachment
@@ -300,15 +1049,15 @@ class AttachmentController extends Controller
         if (!$user->hasRole(['admin', 'verifier']) && $attachment->user_id !== $user->id) {
             abort(403, 'غير مصرح لك بحذف هذا المرفق.');
         }
-        
+
         // Delete the file
         if (Storage::disk('public')->exists($attachment->file_path)) {
             Storage::disk('public')->delete($attachment->file_path);
         }
-        
+
         // Delete the record
         $attachment->delete();
-        
+
         return redirect()->back()->with('success', 'تم حذف المرفق بنجاح');
     }
 
@@ -316,29 +1065,29 @@ class AttachmentController extends Controller
     private function canAccessAttachment(Attachment $attachment)
     {
         $user = Auth::user();
-        
+
         // Admin and verifier can access all attachments
         if ($user->hasRole(['admin', 'verifier'])) {
             return true;
         }
-        
+
         // If it's a vehicle attachment
         if ($attachment->attachable_type === 'App\Models\Vehicle') {
             $vehicle = $attachment->attachable;
-            
+
             // Data entry can access own directorate's vehicles
             if ($user->hasRole('data_entry') && $vehicle->directorate_id === $user->directorate_id) {
                 return true;
             }
-            
+
             // Vehicles department can access final degree or authenticated vehicles
-            if ($user->hasRole('vehicles_dept') && 
-                ($vehicle->type === 'government' || 
-                 $vehicle->final_degree_status === 'مكتسبة' || 
+            if ($user->hasRole('vehicles_dept') &&
+                ($vehicle->type === 'government' ||
+                 $vehicle->final_degree_status === 'مكتسبة' ||
                  $vehicle->authentication_status === 'تمت المصادقة عليها')) {
                 return true;
             }
-            
+
             // Recipients can access vehicles transferred to them
             if ($user->hasRole('recipient')) {
                 return $vehicle->transfers()
@@ -346,60 +1095,60 @@ class AttachmentController extends Controller
                     ->exists();
             }
         }
-        
+
         // If it's a transfer attachment
         if ($attachment->attachable_type === 'App\Models\VehicleTransfer') {
             $transfer = $attachment->attachable;
-            
+
             // Vehicles department can access all transfers
             if ($user->hasRole('vehicles_dept')) {
                 return true;
             }
-            
+
             // Data entry can access transfers for own directorate's vehicles
             if ($user->hasRole('data_entry') && $transfer->vehicle->directorate_id === $user->directorate_id) {
                 return true;
             }
-            
+
             // Recipients can access transfers to their directorate
             if ($user->hasRole('recipient') && $transfer->destination_directorate_id === $user->directorate_id) {
                 return true;
             }
         }
-        
+
         // If it's an edit request attachment
         if ($attachment->attachable_type === 'App\Models\EditRequest') {
             $editRequest = $attachment->attachable;
-            
+
             // Creator can access their own edit request attachments
             if ($editRequest->user_id === $user->id) {
                 return true;
             }
-            
+
             // Data entry can access edit requests for own directorate's vehicles
             if ($user->hasRole('data_entry') && $editRequest->vehicle->directorate_id === $user->directorate_id) {
                 return true;
             }
         }
-        
+
         // If it's a vehicle status attachment
         if ($attachment->attachable_type === 'App\Models\VehicleStatus') {
             $status = $attachment->attachable;
-            
+
             // Data entry can access status updates for own directorate's vehicles
             if ($user->hasRole('data_entry') && $status->vehicle->directorate_id === $user->directorate_id) {
                 return true;
             }
-            
+
             // Vehicles department can access status updates for final degree or authenticated vehicles
-            if ($user->hasRole('vehicles_dept') && 
-                ($status->vehicle->type === 'government' || 
-                 $status->vehicle->final_degree_status === 'مكتسبة' || 
+            if ($user->hasRole('vehicles_dept') &&
+                ($status->vehicle->type === 'government' ||
+                 $status->vehicle->final_degree_status === 'مكتسبة' ||
                  $status->vehicle->authentication_status === 'تمت المصادقة عليها')) {
                 return true;
             }
         }
-        
+
         // User owns the attachment
         return $attachment->user_id === $user->id;
     }
@@ -839,6 +1588,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Carbon\Carbon;
 
 class NotificationController extends Controller
 {
@@ -846,49 +1596,93 @@ class NotificationController extends Controller
     {
         $this->middleware('auth');
     }
-    
+
     /**
      * Display a listing of the notifications.
      */
     public function index()
     {
         $user = Auth::user();
+
+        // Automatically mark old notifications as read
+        $user->unreadNotifications()
+             ->where('created_at', '<', Carbon::now()->subWeek())
+             ->update(['read_at' => Carbon::now()]);
+
         $notifications = $user->notifications()->paginate(20);
         $unreadCount = $user->unreadNotifications()->count();
-        
+
         return view('notifications.index', compact('notifications', 'unreadCount'));
     }
-    
+
     /**
      * Mark a specific notification as read.
      */
     public function markAsRead(Request $request, $id)
     {
         $notification = Auth::user()->notifications()->where('id', $id)->first();
-        
+
         if ($notification) {
             $notification->markAsRead();
         }
-        
+
         if ($request->ajax()) {
-            return response()->json(['success' => true]);
+            return response()->json([
+                'success' => true,
+                'unreadCount' => Auth::user()->unreadNotifications()->count()
+            ]);
         }
-        
+
         return back()->with('success', 'تم تحديد الإشعار كمقروء');
     }
-    
+
     /**
      * Mark all notifications as read.
      */
     public function markAllAsRead(Request $request)
     {
         Auth::user()->unreadNotifications->markAsRead();
-        
+
+        if ($request->ajax()) {
+            return response()->json(['success' => true, 'unreadCount' => 0]);
+        }
+
+        return back()->with('success', 'تم تحديد جميع الإشعارات كمقروءة');
+    }
+
+    /**
+     * Delete a notification.
+     */
+    public function destroy(Request $request, $id)
+    {
+        $notification = Auth::user()->notifications()->where('id', $id)->first();
+
+        if ($notification) {
+            $notification->delete();
+        }
+
+        if ($request->ajax()) {
+            return response()->json([
+                'success' => true,
+                'unreadCount' => Auth::user()->unreadNotifications()->count()
+            ]);
+        }
+
+        return back()->with('success', 'تم حذف الإشعار بنجاح');
+    }
+
+    /**
+     * Delete all notifications.
+     */
+    public function destroyAll(Request $request)
+    {
+        Auth::user()->notifications()->delete();
+
         if ($request->ajax()) {
             return response()->json(['success' => true]);
         }
-        
-        return back()->with('success', 'تم تحديد جميع الإشعارات كمقروءة');
+
+        return back()->with('success', 'تم حذف جميع الإشعارات بنجاح');
     }
 }
 </file>
@@ -1061,17 +1855,17 @@ class VehicleController extends Controller
         $this->middleware('permission:edit vehicles')->only(['edit', 'update']);
         $this->middleware('permission:delete vehicles')->only('destroy');
     }
-    
+
     public function index(Request $request)
     {
         $user = Auth::user();
         $query = Vehicle::with(['directorate', 'user']);
-        
+
         // Apply filtering
         if ($request->has('type')) {
             $query->where('type', $request->type);
         }
-        
+
         if ($request->has('status')) {
             $status = $request->status;
             if ($status == 'محجوزة' || $status == 'مصادرة' || $status == 'مفرج عنها') {
@@ -1084,11 +1878,11 @@ class VehicleController extends Controller
                 $query->where('valuation_status', $status);
             }
         }
-        
+
         if ($request->has('directorate_id') && $user->hasRole(['admin', 'verifier'])) {
             $query->where('directorate_id', $request->directorate_id);
         }
-        
+
         if ($request->has('search')) {
             $search = $request->search;
             $query->where(function($q) use ($search) {
@@ -1099,18 +1893,18 @@ class VehicleController extends Controller
                   ->orWhere('defendant_name', 'like', "%{$search}%");
             });
         }
-        
+
         // Apply directorate restrictions based on user role
         $vehicles = $query->forUserDirectorate($user)
             ->latest()
             ->paginate(10)
             ->withQueryString();
-        
+
         $directorates = [];
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         return view('vehicles.index', compact('vehicles', 'directorates'));
     }
 
@@ -1118,15 +1912,15 @@ class VehicleController extends Controller
     {
         $user = Auth::user();
         $directorates = [];
-        
+
         // If admin or verifier, show all directorates
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         // تمكين مستخدمي الآليات من إضافة العجلات الحكومية
         $canAddGovernmentVehicle = $user->hasRole(['admin', 'verifier', 'vehicles_dept']);
-        
+
         return view('vehicles.create', compact('directorates', 'canAddGovernmentVehicle'));
     }
 
@@ -1147,39 +1941,39 @@ class VehicleController extends Controller
             'accessories' => 'nullable|array',
             'defects' => 'nullable|array',
             'missing_parts' => 'nullable|string',
-            
+
             // Confiscated vehicle fields
             'defendant_name' => 'required_if:type,confiscated|nullable|string|max:255',
             'legal_article' => 'required_if:type,confiscated|nullable|string|max:255',
             'seizure_status' => 'required_if:type,confiscated|nullable|in:محجوزة,مفرج عنها,مصادرة',
             'seizure_letter_number' => 'nullable|string|max:255',
             'seizure_letter_date' => 'nullable|date',
-            
+
             // Government vehicle fields
             'source' => 'required_if:type,government|nullable|string|max:255',
             'import_letter_number' => 'nullable|string|max:255',
             'import_letter_date' => 'nullable|date',
-            
+
             'images.*' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
             'attachments.*' => 'nullable|file|mimes:pdf,doc,docx|max:5120',
         ]);
-        
+
         // Create the vehicle
         $user = Auth::user();
-        
+
         // التحقق من صلاحية إضافة عجلات حكومية
         if ($validatedData['type'] == 'government' && !$user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
             return redirect()->route('vehicles.index')
                 ->with('error', 'ليس لديك صلاحية لإضافة العجلات الحكومية');
         }
-        
+
         // Set directorate_id to user's directorate if not admin/verifier
         if (!$user->hasRole(['admin', 'verifier'])) {
             $validatedData['directorate_id'] = $user->directorate_id;
         }
-        
+
         $validatedData['user_id'] = $user->id;
-        
+
         // Set default status for confiscated vehicles
         if ($validatedData['type'] == 'confiscated') {
             $validatedData['final_degree_status'] = 'غير مكتسبة';
@@ -1188,15 +1982,15 @@ class VehicleController extends Controller
             $validatedData['donation_status'] = 'غير مهداة';
             $validatedData['government_registration_status'] = 'غير مرقمة';
         }
-        
+
         $vehicle = Vehicle::create($validatedData);
-        
+
         // Handle images
         if ($request->hasFile('images')) {
             foreach ($request->file('images') as $image) {
                 $filename = time() . '_' . $image->getClientOriginalName();
                 $path = $image->storeAs('vehicle_images', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -1209,13 +2003,13 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         // Handle attachments
         if ($request->hasFile('attachments')) {
             foreach ($request->file('attachments') as $file) {
                 $filename = time() . '_' . $file->getClientOriginalName();
                 $path = $file->storeAs('vehicle_documents', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -1228,7 +2022,7 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم إضافة العجلة بنجاح');
     }
@@ -1236,31 +2030,31 @@ class VehicleController extends Controller
     public function show(Vehicle $vehicle)
     {
         $this->authorize('view', $vehicle);
-        
+
         $vehicle->load(['directorate', 'user', 'statuses.user', 'transfers.user', 'editRequests.user', 'attachments']);
-        
+
         return view('vehicles.show', compact('vehicle'));
     }
 
     public function edit(Vehicle $vehicle)
     {
         $this->authorize('update', $vehicle);
-        
+
         $user = Auth::user();
         $directorates = [];
-        
+
         // If admin or verifier, show all directorates
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         return view('vehicles.edit', compact('vehicle', 'directorates'));
     }
 
     public function update(Request $request, Vehicle $vehicle)
     {
         $this->authorize('update', $vehicle);
-        
+
         // Validate the request
         $validatedData = $request->validate([
             'type' => 'required|in:confiscated,government',
@@ -1276,29 +2070,29 @@ class VehicleController extends Controller
             'accessories' => 'nullable|array',
             'defects' => 'nullable|array',
             'missing_parts' => 'nullable|string',
-            
+
             // Confiscated vehicle fields
             'defendant_name' => 'required_if:type,confiscated|nullable|string|max:255',
             'legal_article' => 'required_if:type,confiscated|nullable|string|max:255',
-            
+
             // Don't allow updating status through this form
-            
+
             // Government vehicle fields
             'source' => 'required_if:type,government|nullable|string|max:255',
-            
+
             'notes' => 'nullable|string',
             'images.*' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
             'attachments.*' => 'nullable|file|mimes:pdf,doc,docx|max:5120',
         ]);
-        
+
         $vehicle->update($validatedData);
-        
+
         // Handle images
         if ($request->hasFile('images')) {
             foreach ($request->file('images') as $image) {
                 $filename = time() . '_' . $image->getClientOriginalName();
                 $path = $image->storeAs('vehicle_images', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -1311,13 +2105,13 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         // Handle attachments
         if ($request->hasFile('attachments')) {
             foreach ($request->file('attachments') as $file) {
                 $filename = time() . '_' . $file->getClientOriginalName();
                 $path = $file->storeAs('vehicle_documents', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -1330,7 +2124,7 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث العجلة بنجاح');
     }
@@ -1338,16 +2132,64 @@ class VehicleController extends Controller
     public function destroy(Vehicle $vehicle)
     {
         $this->authorize('delete', $vehicle);
-        
+
         // Delete associated files
         foreach ($vehicle->attachments as $attachment) {
             Storage::disk('public')->delete($attachment->file_path);
         }
-        
+
         $vehicle->delete();
-        
+
         return redirect()->route('vehicles.index')
             ->with('success', 'تم حذف العجلة بنجاح');
+    }
+    public function stalled()
+    {
+        // Ensure only admin can access
+        $this->authorize('view', Vehicle::class);
+
+        // Get vehicles that haven't changed status in 2 months
+        $twoMonthsAgo = now()->subMonths(2);
+
+        // Get stalled vehicles for different status types
+        $stalledVehicles = [
+            'seizure' => Vehicle::confiscated()
+                ->where('seizure_status', 'محجوزة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'confiscation' => Vehicle::confiscated()
+                ->where('seizure_status', 'مصادرة')
+                ->where('final_degree_status', 'غير مكتسبة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'final_degree' => Vehicle::confiscated()
+                ->where('final_degree_status', 'مكتسبة')
+                ->where('valuation_status', 'غير مثمنة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'valuation' => Vehicle::confiscated()
+                ->where('valuation_status', 'مثمنة')
+                ->where('authentication_status', 'غير مصادق عليها')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'authentication' => Vehicle::confiscated()
+                ->where('authentication_status', 'تمت المصادقة عليها')
+                ->where('donation_status', 'غير مهداة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'donation' => Vehicle::confiscated()
+                ->where('donation_status', 'مهداة')
+                ->where('government_registration_status', 'غير مرقمة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+        ];
+
+        return view('vehicles.stalled', compact('stalledVehicles'));
     }
 }
 </file>
@@ -1372,7 +2214,7 @@ class VehicleStatusController extends Controller
     {
         $this->middleware('permission:update vehicle status');
     }
-    
+
     public function updateSeizureStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1383,29 +2225,29 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check if the current status is final and trying to go back
         if ($vehicle->seizure_status === 'مصادرة' && $validatedData['seizure_status'] !== 'مصادرة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن تغيير الحالة من مصادرة إلى أي حالة أخرى إلا بموافقة المدقق أو المشرف');
             }
         }
-        
+
         // Check if going from released to seized needs admin/verifier approval
         if ($vehicle->seizure_status === 'مفرج عنها' && $validatedData['seizure_status'] === 'محجوزة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن تغيير الحالة من مفرج عنها إلى محجوزة إلا بموافقة المدقق أو المشرف');
             }
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->seizure_status;
-        
+
         // Update vehicle status
         $vehicle->seizure_status = $validatedData['seizure_status'];
-        
+
         // Reset dependent statuses when moving backwards
         if ($oldStatus === 'مصادرة' && $validatedData['seizure_status'] !== 'مصادرة') {
             $vehicle->final_degree_status = 'غير مكتسبة';
@@ -1413,7 +2255,7 @@ class VehicleStatusController extends Controller
             $vehicle->authentication_status = 'غير مصادق عليها';
             $vehicle->donation_status = 'غير مهداة';
             $vehicle->government_registration_status = 'غير مرقمة';
-            
+
             // Clear related fields
             $vehicle->decision_number = null;
             $vehicle->decision_date = null;
@@ -1427,7 +2269,7 @@ class VehicleStatusController extends Controller
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         // Update relevant letter information based on status
         if ($validatedData['seizure_status'] == 'محجوزة') {
             $vehicle->seizure_letter_number = $validatedData['letter_number'];
@@ -1439,9 +2281,9 @@ class VehicleStatusController extends Controller
             $vehicle->confiscation_letter_number = $validatedData['letter_number'];
             $vehicle->confiscation_letter_date = $validatedData['letter_date'];
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1453,13 +2295,13 @@ class VehicleStatusController extends Controller
             'letter_date' => $validatedData['letter_date'],
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             $attachmentType = '';
             if ($validatedData['seizure_status'] == 'محجوزة') {
                 $attachmentType = 'seizure_letter';
@@ -1468,7 +2310,7 @@ class VehicleStatusController extends Controller
             } elseif ($validatedData['seizure_status'] == 'مصادرة') {
                 $attachmentType = 'confiscation_letter';
             }
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1480,14 +2322,12 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'seizure_status', $oldStatus, $validatedData['seizure_status']);
-        
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة العجلة بنجاح');
     }
-    
+
     public function updateFinalDegreeStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1498,26 +2338,26 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required_if:final_degree_status,مكتسبة|nullable|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check pre-conditions
         if ($vehicle->seizure_status != 'مصادرة') {
             return redirect()->back()->with('error', 'لا يمكن تحديث حالة اكتساب الدرجة القطعية إلا بعد مصادرة العجلة');
         }
-        
+
         // Going back from acquired to not acquired requires admin/verifier
         if ($vehicle->final_degree_status === 'مكتسبة' && $validatedData['final_degree_status'] === 'غير مكتسبة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن إلغاء اكتساب الدرجة القطعية إلا بموافقة المدقق أو المشرف');
             }
-            
+
             // Reset dependent statuses
             $vehicle->valuation_status = 'غير مثمنة';
             $vehicle->authentication_status = 'غير مصادق عليها';
             $vehicle->donation_status = 'غير مهداة';
             $vehicle->government_registration_status = 'غير مرقمة';
-            
+
             // Clear related fields
             $vehicle->valuation_amount = null;
             $vehicle->authentication_number = null;
@@ -1529,13 +2369,13 @@ class VehicleStatusController extends Controller
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->final_degree_status;
-        
+
         // Update vehicle status
         $vehicle->final_degree_status = $validatedData['final_degree_status'];
-        
+
         if ($validatedData['final_degree_status'] == 'مكتسبة') {
             $vehicle->decision_number = $validatedData['decision_number'];
             $vehicle->decision_date = $validatedData['decision_date'];
@@ -1543,9 +2383,9 @@ class VehicleStatusController extends Controller
             $vehicle->decision_number = null;
             $vehicle->decision_date = null;
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1557,13 +2397,13 @@ class VehicleStatusController extends Controller
             'letter_date' => $validatedData['decision_date'] ?? null,
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1575,14 +2415,13 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'final_degree_status', $oldStatus, $validatedData['final_degree_status']);
-        
+
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة اكتساب الدرجة القطعية بنجاح');
     }
-    
+
     public function updateValuationStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1592,25 +2431,25 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required_if:valuation_status,مثمنة|nullable|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check pre-conditions - تم تغيير التسلسل ليكون التثمين بعد الدرجة القطعية وقبل المصادقة
         if ($vehicle->final_degree_status != 'مكتسبة') {
             return redirect()->back()->with('error', 'لا يمكن تثمين العجلة إلا بعد اكتساب الدرجة القطعية');
         }
-        
+
         // Going back from valued to not valued requires admin/verifier
         if ($vehicle->valuation_status === 'مثمنة' && $validatedData['valuation_status'] === 'غير مثمنة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن إلغاء التثمين إلا بموافقة المدقق أو المشرف');
             }
-            
+
             // Reset dependent statuses
             $vehicle->authentication_status = 'غير مصادق عليها';
             $vehicle->donation_status = 'غير مهداة';
             $vehicle->government_registration_status = 'غير مرقمة';
-            
+
             // Clear related fields
             $vehicle->authentication_number = null;
             $vehicle->authentication_date = null;
@@ -1621,21 +2460,21 @@ class VehicleStatusController extends Controller
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->valuation_status;
-        
+
         // Update vehicle status
         $vehicle->valuation_status = $validatedData['valuation_status'];
-        
+
         if ($validatedData['valuation_status'] == 'مثمنة') {
             $vehicle->valuation_amount = $validatedData['valuation_amount'];
         } else {
             $vehicle->valuation_amount = null;
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1645,13 +2484,13 @@ class VehicleStatusController extends Controller
             'new_status' => $validatedData['valuation_status'],
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1663,14 +2502,13 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'valuation_status', $oldStatus, $validatedData['valuation_status']);
-        
+
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة التثمين بنجاح');
     }
-    
+
     public function updateAuthenticationStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1681,24 +2519,24 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required_if:authentication_status,تمت المصادقة عليها|nullable|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check pre-conditions - تم تغيير التسلسل ليكون المصادقة بعد التثمين
         if ($vehicle->valuation_status != 'مثمنة') {
             return redirect()->back()->with('error', 'لا يمكن تحديث حالة المصادقة إلا بعد تثمين العجلة');
         }
-        
+
         // Going back from authenticated to not authenticated requires admin/verifier
         if ($vehicle->authentication_status === 'تمت المصادقة عليها' && $validatedData['authentication_status'] === 'غير مصادق عليها') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن إلغاء المصادقة إلا بموافقة المدقق أو المشرف');
             }
-            
+
             // Reset dependent statuses
             $vehicle->donation_status = 'غير مهداة';
             $vehicle->government_registration_status = 'غير مرقمة';
-            
+
             // Clear related fields
             $vehicle->donation_letter_number = null;
             $vehicle->donation_letter_date = null;
@@ -1707,13 +2545,13 @@ class VehicleStatusController extends Controller
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->authentication_status;
-        
+
         // Update vehicle status
         $vehicle->authentication_status = $validatedData['authentication_status'];
-        
+
         if ($validatedData['authentication_status'] == 'تمت المصادقة عليها') {
             $vehicle->authentication_number = $validatedData['authentication_number'];
             $vehicle->authentication_date = $validatedData['authentication_date'];
@@ -1721,9 +2559,9 @@ class VehicleStatusController extends Controller
             $vehicle->authentication_number = null;
             $vehicle->authentication_date = null;
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1735,13 +2573,13 @@ class VehicleStatusController extends Controller
             'letter_date' => $validatedData['authentication_date'] ?? null,
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1753,14 +2591,13 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'authentication_status', $oldStatus, $validatedData['authentication_status']);
-        
+
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة المصادقة بنجاح');
     }
-    
+
     public function updateDonationStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1772,35 +2609,35 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required_if:donation_status,مهداة|nullable|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check pre-conditions
         if ($vehicle->authentication_status != 'تمت المصادقة عليها') {
             return redirect()->back()->with('error', 'لا يمكن تحديث حالة الإهداء إلا بعد المصادقة على العجلة');
         }
-        
+
         // Going back from donated to not donated requires admin/verifier
         if ($vehicle->donation_status === 'مهداة' && $validatedData['donation_status'] === 'غير مهداة') {
             if (!$user->hasRole(['admin', 'verifier'])) {
                 return redirect()->back()->with('error', 'لا يمكن إلغاء الإهداء إلا بموافقة المدقق أو المشرف');
             }
-            
+
             // Reset dependent statuses
             $vehicle->government_registration_status = 'غير مرقمة';
-            
+
             // Clear related fields
             $vehicle->registration_letter_number = null;
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->donation_status;
-        
+
         // Update vehicle status
         $vehicle->donation_status = $validatedData['donation_status'];
-        
+
         if ($validatedData['donation_status'] == 'مهداة') {
             $vehicle->donation_letter_number = $validatedData['donation_letter_number'];
             $vehicle->donation_letter_date = $validatedData['donation_letter_date'];
@@ -1810,9 +2647,9 @@ class VehicleStatusController extends Controller
             $vehicle->donation_letter_date = null;
             $vehicle->donation_entity = null;
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1824,13 +2661,13 @@ class VehicleStatusController extends Controller
             'letter_date' => $validatedData['donation_letter_date'] ?? null,
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1842,14 +2679,13 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'donation_status', $oldStatus, $validatedData['donation_status']);
-        
+
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة الإهداء بنجاح');
     }
-    
+
     public function updateRegistrationStatus(Request $request, Vehicle $vehicle)
     {
         // Validate the request
@@ -1861,9 +2697,9 @@ class VehicleStatusController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required_if:government_registration_status,مرقمة|nullable|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // Check pre-conditions
         if ($vehicle->donation_status != 'مهداة') {
             return redirect()->back()->with('error', 'لا يمكن تحديث حالة الترقيم الحكومي إلا بعد إهداء العجلة');
@@ -1877,13 +2713,13 @@ class VehicleStatusController extends Controller
                 return redirect()->back()->with('error', 'لا يمكن إلغاء الترقيم الحكومي إلا بموافقة المدقق أو المشرف');
             }
         }
-        
+
         // Store the old status for history
         $oldStatus = $vehicle->government_registration_status;
-        
+
         // Update vehicle status
         $vehicle->government_registration_status = $validatedData['government_registration_status'];
-        
+
         if ($validatedData['government_registration_status'] == 'مرقمة') {
             $vehicle->registration_letter_number = $validatedData['registration_letter_number'];
             $vehicle->registration_letter_date = $validatedData['registration_letter_date'];
@@ -1893,9 +2729,9 @@ class VehicleStatusController extends Controller
             $vehicle->registration_letter_date = null;
             $vehicle->government_registration_number = null;
         }
-        
+
         $vehicle->save();
-        
+
         // Create status history record
         $status = VehicleStatus::create([
             'vehicle_id' => $vehicle->id,
@@ -1907,13 +2743,13 @@ class VehicleStatusController extends Controller
             'letter_date' => $validatedData['registration_letter_date'] ?? null,
             'notes' => $validatedData['notes'],
         ]);
-        
+
         // Handle attachment
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('status_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleStatus',
                 'attachable_id' => $status->id,
@@ -1925,52 +2761,15 @@ class VehicleStatusController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
-        // Notify relevant users
-        $this->notifyStatusUpdate($vehicle, 'government_registration_status', $oldStatus, $validatedData['government_registration_status']);
-        
+
+
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث حالة الترقيم الحكومي بنجاح');
     }
-    
+
     // Helper method to send notifications
-    private function notifyStatusUpdate($vehicle, $statusType, $oldStatus, $newStatus)
-    {
-        // Find users who should be notified
-        $usersToNotify = [];
-        
-        // Add admin and verifier users
-        $adminUsers = User::role(['admin', 'verifier'])->get();
-        foreach ($adminUsers as $adminUser) {
-            $usersToNotify[] = $adminUser;
-        }
-        
-        // Add users from the same directorate
-        $directorate = $vehicle->directorate;
-        if ($directorate) {
-            $directoryUsers = User::where('directorate_id', $directorate->id)
-                                  ->whereNotIn('id', $adminUsers->pluck('id')->toArray())
-                                  ->get();
-            foreach ($directoryUsers as $dirUser) {
-                $usersToNotify[] = $dirUser;
-            }
-        }
-        
-        // Add vehicles department users for specific statuses
-        if (in_array($statusType, ['final_degree_status', 'authentication_status', 'valuation_status', 'donation_status', 'government_registration_status'])) {
-            $vehiclesDeptUsers = User::role('vehicles_dept')
-                                     ->whereNotIn('id', collect($usersToNotify)->pluck('id')->toArray())
-                                     ->get();
-            foreach ($vehiclesDeptUsers as $vdUser) {
-                $usersToNotify[] = $vdUser;
-            }
-        }
-        
-        // Send notifications
-        foreach ($usersToNotify as $user) {
-            $user->notify(new VehicleStatusUpdated($vehicle, $statusType, $oldStatus, $newStatus, Auth::user()));
-        }
-    }
+
 }
 </file>
 
@@ -1996,19 +2795,19 @@ class VehicleTransferController extends Controller
         $this->middleware('permission:create transfers')->only(['create', 'store']);
         $this->middleware('permission:view transfers')->only(['index', 'show']);
     }
-    
+
     public function index(Request $request)
     {
         $user = Auth::user();
         $query = VehicleTransfer::with(['vehicle', 'user', 'destinationDirectorate']);
-        
+
         // Filter by directorate
         if ($user->hasRole('recipient')) {
             $query->where('destination_directorate_id', $user->directorate_id);
         } elseif ($request->has('directorate_id') && $user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
             $query->where('destination_directorate_id', $request->directorate_id);
         }
-        
+
         // Filter by vehicle type
         if ($request->has('vehicle_type')) {
             $query->whereHas('vehicle', function($q) use ($request) {
@@ -2024,7 +2823,7 @@ class VehicleTransferController extends Controller
                 $query->whereNotNull('return_date');
             }
         }
-        
+
         // Filter by transfer type
         if ($request->has('transfer_type')) {
             if ($request->transfer_type === 'regular') {
@@ -2035,12 +2834,12 @@ class VehicleTransferController extends Controller
                 $query->where('is_referral', true);
             }
         }
-        
+
         // Filter by recipient ID number
         if ($request->has('recipient_id_number') && !empty($request->recipient_id_number)) {
             $query->where('recipient_id_number', 'like', '%' . $request->recipient_id_number . '%');
         }
-        
+
         // Search
         if ($request->has('search')) {
             $search = $request->search;
@@ -2057,14 +2856,14 @@ class VehicleTransferController extends Controller
                   });
             });
         }
-        
+
         $transfers = $query->latest()->paginate(10)->withQueryString();
-        
+
         $directorates = [];
         if ($user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
             $directorates = Directorate::all();
         }
-        
+
         // للتحذير من الأشخاص الذين لديهم أكثر من عجلة مستلمة
         $activeTransferCountsByRecipient = [];
         if ($user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
@@ -2078,20 +2877,20 @@ class VehicleTransferController extends Controller
                 ->pluck('total', 'recipient_id_number')
                 ->toArray();
         }
-        
+
         return view('transfers.index', compact('transfers', 'directorates', 'activeTransferCountsByRecipient'));
     }
-    
+
     public function create(Vehicle $vehicle)
     {
         $user = Auth::user();
-        
+
         // التحقق مما إذا كانت العجلة قابلة للمناقلة
         if (!$vehicle->isTransferable()) {
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن مناقلة هذه العجلة حتى تكتسب الدرجة القطعية أو تتم المصادقة عليها');
         }
-        
+
         // التحقق مما إذا كانت هناك مناقلة نشطة بالفعل
         if ($vehicle->getActiveTransfers()->count() > 0) {
             return redirect()->route('vehicles.show', $vehicle)
@@ -2103,12 +2902,12 @@ class VehicleTransferController extends Controller
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن مناقلة هذه العجلة لأنها محالة لجهة خارجية: ' . $vehicle->external_entity);
         }
-        
+
         $directorates = Directorate::all();
-        
+
         return view('transfers.create', compact('vehicle', 'directorates'));
     }
-    
+
     public function store(Request $request, Vehicle $vehicle)
     {
         // التحقق مما إذا كانت العجلة قابلة للمناقلة
@@ -2116,19 +2915,19 @@ class VehicleTransferController extends Controller
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن مناقلة هذه العجلة حتى تكتسب الدرجة القطعية أو تتم المصادقة عليها');
         }
-        
+
         // التحقق مما إذا كانت هناك مناقلة نشطة بالفعل
         if ($vehicle->getActiveTransfers()->count() > 0) {
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن إنشاء مناقلة جديدة حتى يتم إنهاء المناقلة الحالية');
         }
-    
+
         // التحقق مما إذا كانت العجلة محالة لجهة خارجية
         if ($vehicle->is_externally_referred) {
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن مناقلة هذه العجلة لأنها محالة لجهة خارجية: ' . $vehicle->external_entity);
         }
-        
+
         // التحقق من البيانات
         $validatedData = $request->validate([
             'recipient_name' => 'required|string|max:255',
@@ -2141,9 +2940,9 @@ class VehicleTransferController extends Controller
             'notes' => 'nullable|string',
             'attachment' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         $user = Auth::user();
-        
+
         // التحقق مما إذا كان المستلم لديه عجلات نشطة أخرى
         if (!empty($validatedData['recipient_id_number'])) {
             $activeTransfersCount = VehicleTransfer::whereNull('return_date')
@@ -2151,13 +2950,13 @@ class VehicleTransferController extends Controller
                 ->where('is_ownership_transfer', false)
                 ->where('is_referral', false)
                 ->count();
-                
+
             if ($activeTransfersCount > 0) {
                 // نضيف رسالة تحذيرية وليس منع
                 session()->flash('warning', 'تنبيه: المستلم لديه ' . $activeTransfersCount . ' مناقلات نشطة أخرى.');
             }
         }
-        
+
         // إنشاء سجل المناقلة
         $transfer = VehicleTransfer::create([
             'vehicle_id' => $vehicle->id,
@@ -2174,13 +2973,13 @@ class VehicleTransferController extends Controller
             'is_ownership_transfer' => false, // مناقلة عادية
             'is_referral' => false, // ليست إحالة خارجية
         ]);
-        
+
         // التعامل مع المرفقات
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('transfer_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleTransfer',
                 'attachable_id' => $transfer->id,
@@ -2192,39 +2991,38 @@ class VehicleTransferController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
+
         // إرسال الإشعارات
-        $this->notifyTransfer($transfer);
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تسجيل المناقلة بنجاح');
     }
-    
+
     public function show(VehicleTransfer $transfer)
     {
         // التحقق من أن المستخدم يمكنه عرض هذه المناقلة
         $user = Auth::user();
-        
-        if (!$user->hasRole(['admin', 'verifier', 'vehicles_dept']) && 
+
+        if (!$user->hasRole(['admin', 'verifier', 'vehicles_dept']) &&
             !($user->hasRole('recipient') && $transfer->destination_directorate_id === $user->directorate_id) &&
             !($user->hasRole('data_entry') && $transfer->vehicle->directorate_id === $user->directorate_id)) {
             abort(403, 'غير مصرح لك بعرض هذه المناقلة');
         }
-        
+
         $transfer->load(['vehicle', 'user', 'destinationDirectorate', 'attachments', 'completer']);
-        
+
         return view('transfers.show', compact('transfer'));
     }
-    
+
     public function completeTransfer(Request $request, VehicleTransfer $transfer)
     {
         // التحقق من أن المستخدم يمكنه إكمال هذه المناقلة
         $user = Auth::user();
-        
+
         if (!$user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
             abort(403, 'غير مصرح لك بإكمال هذه المناقلة');
         }
-        
+
         // التحقق مما إذا كانت المناقلة مكتملة بالفعل
         if ($transfer->return_date !== null) {
             return redirect()->route('transfers.show', $transfer)
@@ -2236,26 +3034,26 @@ class VehicleTransferController extends Controller
             return redirect()->route('transfers.show', $transfer)
                 ->with('error', 'لا يمكن إكمال هذه المناقلة لأنها ' . ($transfer->is_ownership_transfer ? 'نقل ملكية' : 'إحالة خارجية'));
         }
-        
+
         // التحقق من البيانات
         $validatedData = $request->validate([
             'return_date' => 'required|date',
             'notes' => 'nullable|string',
             'attachment' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         // تحديث سجل المناقلة
         $transfer->return_date = $validatedData['return_date'];
         $transfer->notes = $validatedData['notes'] ? $transfer->notes . "\n" . $validatedData['notes'] : $transfer->notes;
         $transfer->completed_by = $user->id;
         $transfer->save();
-        
+
         // التعامل مع المرفقات
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('transfer_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleTransfer',
                 'attachable_id' => $transfer->id,
@@ -2267,17 +3065,17 @@ class VehicleTransferController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
+
         return redirect()->route('transfers.show', $transfer)
             ->with('success', 'تم إكمال المناقلة بنجاح');
     }
-    
+
     // دالة لنقل ملكية عجلة إلى مديرية أخرى
     public function transferOwnership(Request $request, Vehicle $vehicle)
     {
         // التحقق من أن المستخدم يمكنه نقل الملكية
         $user = Auth::user();
-        
+
         if (!$user->hasRole(['admin', 'verifier'])) {
             abort(403, 'غير مصرح لك بنقل ملكية العجلة');
         }
@@ -2287,26 +3085,26 @@ class VehicleTransferController extends Controller
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'لا يمكن نقل ملكية هذه العجلة لأنها محالة لجهة خارجية: ' . $vehicle->external_entity);
         }
-        
+
         // التحقق من البيانات
         $validatedData = $request->validate([
             'directorate_id' => 'required|exists:directorates,id',
             'reason' => 'required|string',
             'attachment' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         // التحقق من أن الوجهة مختلفة عن المديرية الحالية
         if ($vehicle->directorate_id == $validatedData['directorate_id']) {
             return redirect()->back()->with('error', 'المديرية المحددة هي نفسها المديرية الحالية للعجلة');
         }
-        
+
         // تخزين المديرية القديمة للسجل
         $oldDirectorate = $vehicle->directorate;
-        
+
         // تحديث مديرية العجلة
         $vehicle->directorate_id = $validatedData['directorate_id'];
         $vehicle->save();
-        
+
         // إنشاء سجل مناقلة خاص لنقل الملكية
         $transfer = VehicleTransfer::create([
             'vehicle_id' => $vehicle->id,
@@ -2319,19 +3117,19 @@ class VehicleTransferController extends Controller
             'return_date' => null, // لن تعود أبدًا لأنها نقل ملكية
             'is_external' => false,
             'destination_directorate_id' => $validatedData['directorate_id'],
-            'notes' => 'تم نقل ملكية العجلة من ' . $oldDirectorate->name . ' إلى ' . 
-                      Directorate::find($validatedData['directorate_id'])->name . "\n" . 
+            'notes' => 'تم نقل ملكية العجلة من ' . $oldDirectorate->name . ' إلى ' .
+                      Directorate::find($validatedData['directorate_id'])->name . "\n" .
                       'السبب: ' . $validatedData['reason'],
             'is_ownership_transfer' => true, // حقل جديد للتمييز عن المناقلات العادية
             'is_referral' => false,
         ]);
-        
+
         // التعامل مع المرفقات
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('transfer_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleTransfer',
                 'attachable_id' => $transfer->id,
@@ -2343,20 +3141,19 @@ class VehicleTransferController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
+
         // إرسال إشعارات حول نقل الملكية
-        $this->notifyTransfer($transfer);
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم نقل ملكية العجلة بنجاح إلى ' . Directorate::find($validatedData['directorate_id'])->name);
     }
-    
+
     // دالة لإحالة العجلة خارجيًا
     public function externalReferral(Request $request, Vehicle $vehicle)
     {
         // التحقق من أن المستخدم يمكنه عمل إحالة خارجية
         $user = Auth::user();
-        
+
         if (!$user->hasRole(['admin', 'verifier'])) {
             abort(403, 'غير مصرح لك بإحالة العجلة لجهة خارجية');
         }
@@ -2366,7 +3163,7 @@ class VehicleTransferController extends Controller
             return redirect()->route('vehicles.show', $vehicle)
                 ->with('error', 'هذه العجلة محالة بالفعل لجهة خارجية: ' . $vehicle->external_entity);
         }
-        
+
         // التحقق من البيانات
         $validatedData = $request->validate([
             'external_entity' => 'required|string|max:255',
@@ -2377,7 +3174,7 @@ class VehicleTransferController extends Controller
             'reason' => 'required|string',
             'attachment' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:5120',
         ]);
-        
+
         // إنشاء سجل مناقلة خاص للإحالة الخارجية
         $transfer = VehicleTransfer::create([
             'vehicle_id' => $vehicle->id,
@@ -2391,23 +3188,23 @@ class VehicleTransferController extends Controller
             'return_date' => null, // لن تعود من الإحالة الخارجية
             'is_external' => true,
             'destination_directorate_id' => null, // لا توجد مديرية داخلية
-            'notes' => 'تم إحالة العجلة لجهة خارجية: ' . $validatedData['external_entity'] . "\n" . 
+            'notes' => 'تم إحالة العجلة لجهة خارجية: ' . $validatedData['external_entity'] . "\n" .
                       'السبب: ' . $validatedData['reason'],
             'is_ownership_transfer' => false,
             'is_referral' => true, // تحديد كإحالة
         ]);
-        
+
         // تحديث حالة العجلة كمحالة خارجيًا
         $vehicle->is_externally_referred = true;
         $vehicle->external_entity = $validatedData['external_entity'];
         $vehicle->save();
-        
+
         // التعامل مع المرفقات
         if ($request->hasFile('attachment')) {
             $file = $request->file('attachment');
             $filename = time() . '_' . $file->getClientOriginalName();
             $path = $file->storeAs('transfer_documents', $filename, 'public');
-            
+
             Attachment::create([
                 'attachable_type' => 'App\Models\VehicleTransfer',
                 'attachable_id' => $transfer->id,
@@ -2419,47 +3216,14 @@ class VehicleTransferController extends Controller
                 'user_id' => $user->id
             ]);
         }
-        
+
         // إرسال إشعارات حول الإحالة الخارجية
-        $this->notifyTransfer($transfer);
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم إحالة العجلة بنجاح إلى ' . $validatedData['external_entity']);
     }
-    
-    // دالة مساعدة لإرسال الإشعارات
-    private function notifyTransfer($transfer)
-    {
-        // العثور على المستخدمين الذين يجب إخطارهم
-        $usersToNotify = [];
-        
-        // إضافة المشرفين والمدققين
-        $adminUsers = User::role(['admin', 'verifier'])->get();
-        foreach ($adminUsers as $adminUser) {
-            $usersToNotify[] = $adminUser;
-        }
-        
-        // إضافة مستخدمي قسم العجلات
-        $vehiclesDeptUsers = User::role('vehicles_dept')->get();
-        foreach ($vehiclesDeptUsers as $vdUser) {
-            $usersToNotify[] = $vdUser;
-        }
-        
-        // إضافة المستلمين إذا كانت مناقلة داخلية
-        if ($transfer->destination_directorate_id) {
-            $recipientUsers = User::role('recipient')
-                ->where('directorate_id', $transfer->destination_directorate_id)
-                ->get();
-            foreach ($recipientUsers as $recipientUser) {
-                $usersToNotify[] = $recipientUser;
-            }
-        }
-        
-        // إرسال الإشعارات
-        foreach ($usersToNotify as $user) {
-            $user->notify(new VehicleTransferred($transfer, Auth::user()));
-        }
-    }
+
+
 }
 </file>
 
@@ -2540,10 +3304,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class EditRequest extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'vehicle_id',
@@ -2579,6 +3345,37 @@ class EditRequest extends Model
     public function attachments()
     {
         return $this->morphMany(Attachment::class, 'attachable');
+    }
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logOnly(['vehicle_id', 'field_name', 'old_value', 'new_value', 'status'])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    return 'تم إنشاء طلب تعديل جديد';
+                } elseif ($eventName == 'updated' && $this->isDirty('status')) {
+                    if ($this->status == 'approved') {
+                        return 'تمت الموافقة على طلب تعديل';
+                    } elseif ($this->status == 'rejected') {
+                        return 'تم رفض طلب تعديل';
+                    }
+                }
+
+                return 'تم ' . $this->getEventArabicName($eventName) . ' طلب تعديل';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
+    }
+
+    private function getEventArabicName(string $eventName): string
+    {
+        $events = [
+            'created' => 'إنشاء',
+            'updated' => 'تحديث',
+            'deleted' => 'حذف',
+        ];
+
+        return $events[$eventName] ?? $eventName;
     }
 }
 </file>
@@ -2659,10 +3456,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class Vehicle extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'directorate_id',
@@ -2795,7 +3594,7 @@ class Vehicle extends Model
         if ($user->hasRole(['admin', 'verifier'])) {
             return $query; // Can see all vehicles
         }
-        
+
         if ($user->hasRole('vehicles_dept')) {
             // Vehicles department can see government vehicles and confiscated vehicles that have final degree or authenticated
             return $query->where(function($q) {
@@ -2810,14 +3609,14 @@ class Vehicle extends Model
                   });
             });
         }
-        
+
         if ($user->hasRole('recipient')) {
             // Recipients can only see vehicles transferred to their directorate
             return $query->whereHas('transfers', function($q) use ($user) {
                 $q->where('destination_directorate_id', $user->directorate_id);
             });
         }
-        
+
         // Default for data entry - only see their directorate's vehicles
         return $query->where('directorate_id', $user->directorate_id);
     }
@@ -2828,25 +3627,25 @@ class Vehicle extends Model
         switch ($stage) {
             case 'final_degree':
                 return $this->type === 'confiscated' && $this->seizure_status === 'مصادرة';
-            
+
             case 'valuation':
                 return $this->type === 'confiscated' && $this->final_degree_status === 'مكتسبة';
-            
+
             case 'authentication':
                 return $this->type === 'confiscated' && $this->valuation_status === 'مثمنة';
-            
+
             case 'donation':
                 return $this->type === 'confiscated' && $this->authentication_status === 'تمت المصادقة عليها';
-            
+
             case 'government_registration':
                 return $this->type === 'confiscated' && $this->donation_status === 'مهداة';
-            
+
             case 'transfer':
-                return ($this->type === 'government') || 
-                       ($this->type === 'confiscated' && 
-                        ($this->final_degree_status === 'مكتسبة' || 
+                return ($this->type === 'government') ||
+                       ($this->type === 'confiscated' &&
+                        ($this->final_degree_status === 'مكتسبة' ||
                          $this->authentication_status === 'تمت المصادقة عليها'));
-            
+
             default:
                 return false;
         }
@@ -2886,43 +3685,43 @@ class Vehicle extends Model
         if ($this->type === 'government') {
             return 'government';
         }
-        
+
         if ($this->type === 'confiscated') {
             if ($this->is_externally_referred) {
                 return 'externally_referred';
             }
-            
+
             if ($this->government_registration_status === 'مرقمة') {
                 return 'registered';
             }
-            
+
             if ($this->donation_status === 'مهداة') {
                 return 'donated';
             }
-            
+
             if ($this->authentication_status === 'تمت المصادقة عليها') {
                 return 'authenticated';
             }
-            
+
             if ($this->valuation_status === 'مثمنة') {
                 return 'valued';
             }
-            
+
             if ($this->final_degree_status === 'مكتسبة') {
                 return 'final_degree';
             }
-            
+
             if ($this->seizure_status === 'مصادرة') {
                 return 'confiscated';
             }
-            
+
             if ($this->seizure_status === 'مفرج عنها') {
                 return 'released';
             }
-            
+
             return 'seized';
         }
-        
+
         return 'unknown';
     }
 
@@ -2933,7 +3732,7 @@ class Vehicle extends Model
         if ($this->is_externally_referred) {
             return false;
         }
-        
+
         return $this->canProceedToStage('transfer');
     }
 
@@ -2944,17 +3743,17 @@ class Vehicle extends Model
         if ($user->hasRole(['admin', 'verifier'])) {
             return true;
         }
-        
+
         // Data entry can only update vehicles in their directorate
         if ($user->hasRole('data_entry') && $this->directorate_id === $user->directorate_id) {
             return true;
         }
-        
+
         // Vehicles department can update vehicles in the final stages
         if ($user->hasRole('vehicles_dept') && $this->isTransferable()) {
             return true;
         }
-        
+
         return false;
     }
 
@@ -2966,19 +3765,62 @@ class Vehicle extends Model
             ->orderBy('created_at', 'desc')
             ->get();
     }
-    
+
     // Get all attachments from statuses
     public function getAllStatusAttachments()
     {
         $statusIds = $this->statuses->pluck('id')->toArray();
-        
+
         if (empty($statusIds)) {
             return collect([]);
         }
-        
+
         return Attachment::where('attachable_type', 'App\Models\VehicleStatus')
             ->whereIn('attachable_id', $statusIds)
             ->get();
+    }
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logOnly([
+                'type', 'vehicle_type', 'vehicle_name', 'vehicle_number',
+                'seizure_status', 'final_degree_status', 'valuation_status',
+                'authentication_status', 'donation_status', 'government_registration_status'
+            ])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    return 'تمت إضافة عجلة جديدة';
+                }
+                if ($eventName == 'updated') {
+                    // تحديد ما إذا كان التحديث لحالة
+                    $dirtyAttributes = $this->getDirty();
+                    foreach (['seizure_status', 'final_degree_status', 'valuation_status', 'authentication_status', 'donation_status', 'government_registration_status'] as $statusField) {
+                        if (array_key_exists($statusField, $dirtyAttributes)) {
+                            $statusName = $this->getStatusTypeName($statusField);
+                            $oldValue = $this->getOriginal($statusField);
+                            $newValue = $dirtyAttributes[$statusField];
+                            return "تم تحديث {$statusName} من {$oldValue} إلى {$newValue}";
+                        }
+                    }
+                    return 'تم تحديث بيانات العجلة';
+                }
+                return 'تم ' . $this->getEventArabicName($eventName) . ' العجلة';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
+    }
+
+    private function getStatusTypeName($statusField): string
+    {
+        $statusTypes = [
+            'seizure_status' => 'حالة المصادرة',
+            'final_degree_status' => 'الدرجة القطعية',
+            'valuation_status' => 'حالة التثمين',
+            'authentication_status' => 'المصادقة',
+            'donation_status' => 'الإهداء',
+            'government_registration_status' => 'الترقيم الحكومي',
+        ];
+        return $statusTypes[$statusField] ?? $statusField;
     }
 }
 </file>
@@ -3051,10 +3893,12 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Spatie\Activitylog\Traits\LogsActivity;
+use Spatie\Activitylog\LogOptions;
 
 class VehicleTransfer extends Model
 {
-    use HasFactory;
+    use HasFactory, LogsActivity;
 
     protected $fillable = [
         'vehicle_id',
@@ -3144,15 +3988,15 @@ class VehicleTransfer extends Model
         if ($this->is_ownership_transfer) {
             return 'نقل ملكية';
         }
-        
+
         if ($this->is_referral) {
             return 'إحالة خارجية';
         }
-        
+
         if ($this->return_date) {
             return 'مكتملة';
         }
-        
+
         return 'جارية';
     }
 
@@ -3168,11 +4012,11 @@ class VehicleTransfer extends Model
         if ($this->is_ownership_transfer) {
             return $this->attachments->where('type', 'ownership_transfer_document')->first();
         }
-        
+
         if ($this->is_referral) {
             return $this->attachments->where('type', 'external_referral_document')->first();
         }
-        
+
         return $this->attachments->where('type', 'transfer_document')->first();
     }
 
@@ -3181,202 +4025,38 @@ class VehicleTransfer extends Model
     {
         return $this->attachments->where('type', 'return_document')->first();
     }
-}
-</file>
-
-<file path="app/Notifications/VehicleStatusUpdated.php">
-<?php
-
-namespace App\Notifications;
-
-use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Notifications\Messages\MailMessage;
-use Illuminate\Notifications\Notification;
-use App\Models\Vehicle;
-use App\Models\User;
-
-class VehicleStatusUpdated extends Notification implements ShouldQueue
-{
-    use Queueable;
-
-    protected $vehicle;
-    protected $statusType;
-    protected $oldStatus;
-    protected $newStatus;
-    protected $updatedBy;
-
-    /**
-     * Create a new notification instance.
-     */
-    public function __construct(Vehicle $vehicle, $statusType, $oldStatus, $newStatus, User $updatedBy)
+    public function getActivitylogOptions(): LogOptions
     {
-        $this->vehicle = $vehicle;
-        $this->statusType = $statusType;
-        $this->oldStatus = $oldStatus;
-        $this->newStatus = $newStatus;
-        $this->updatedBy = $updatedBy;
+        return LogOptions::defaults()
+            ->logOnly(['vehicle_id', 'recipient_name', 'recipient_entity', 'receive_date', 'return_date', 'is_ownership_transfer', 'is_referral'])
+            ->setDescriptionForEvent(function(string $eventName) {
+                if ($eventName == 'created') {
+                    if ($this->is_ownership_transfer) {
+                        return 'تم نقل ملكية عجلة';
+                    } elseif ($this->is_referral) {
+                        return 'تمت إحالة عجلة خارجيًا';
+                    } else {
+                        return 'تمت مناقلة عجلة';
+                    }
+                } elseif ($eventName == 'updated' && !is_null($this->return_date)) {
+                    return 'تم إكمال مناقلة عجلة';
+                }
+
+                return 'تم ' . $this->getEventArabicName($eventName) . ' مناقلة عجلة';
+            })
+            ->logOnlyDirty()
+            ->dontSubmitEmptyLogs();
     }
 
-    /**
-     * Get the notification's delivery channels.
-     *
-     * @return array<int, string>
-     */
-    public function via(object $notifiable): array
+    private function getEventArabicName(string $eventName): string
     {
-        return ['database'];
-    }
-
-    /**
-     * Get the mail representation of the notification.
-     */
-    public function toMail(object $notifiable): MailMessage
-    {
-        return (new MailMessage)
-                    ->subject('تم تحديث حالة عجلة')
-                    ->line('تم تحديث حالة العجلة رقم: ' . $this->vehicle->id)
-                    ->line('نوع العجلة: ' . $this->vehicle->vehicle_type)
-                    ->line('رقم العجلة: ' . $this->vehicle->vehicle_number)
-                    ->line('نوع التحديث: ' . $this->getStatusTypeName())
-                    ->line('من: ' . $this->oldStatus)
-                    ->line('إلى: ' . $this->newStatus)
-                    ->line('تم التحديث بواسطة: ' . $this->updatedBy->name)
-                    ->action('عرض العجلة', url('/vehicles/' . $this->vehicle->id));
-    }
-
-    /**
-     * Get the array representation of the notification.
-     *
-     * @return array<string, mixed>
-     */
-    public function toArray(object $notifiable): array
-    {
-        return [
-            'vehicle_id' => $this->vehicle->id,
-            'vehicle_type' => $this->vehicle->vehicle_type,
-            'vehicle_number' => $this->vehicle->vehicle_number,
-            'status_type' => $this->statusType,
-            'status_type_name' => $this->getStatusTypeName(),
-            'old_status' => $this->oldStatus,
-            'new_status' => $this->newStatus,
-            'updated_by' => $this->updatedBy->id,
-            'updated_by_name' => $this->updatedBy->name,
-            'updated_at' => now()->toDateTimeString(),
+        $events = [
+            'created' => 'إنشاء',
+            'updated' => 'تحديث',
+            'deleted' => 'حذف',
         ];
-    }
-    
-    /**
-     * Get the status type name in Arabic.
-     */
-    private function getStatusTypeName(): string
-    {
-        $statusTypes = [
-            'seizure_status' => 'حالة المصادرة',
-            'final_degree_status' => 'الدرجة القطعية',
-            'valuation_status' => 'حالة التثمين',
-            'authentication_status' => 'المصادقة',
-            'donation_status' => 'الإهداء',
-            'government_registration_status' => 'الترقيم الحكومي',
-        ];
-        
-        return $statusTypes[$this->statusType] ?? $this->statusType;
-    }
-}
-</file>
 
-<file path="app/Notifications/VehicleTransferred.php">
-<?php
-
-namespace App\Notifications;
-
-use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Notifications\Messages\MailMessage;
-use Illuminate\Notifications\Notification;
-use App\Models\VehicleTransfer;
-use App\Models\User;
-
-class VehicleTransferred extends Notification implements ShouldQueue
-{
-    use Queueable;
-
-    protected $transfer;
-    protected $user;
-
-    /**
-     * Create a new notification instance.
-     */
-    public function __construct(VehicleTransfer $transfer, User $user)
-    {
-        $this->transfer = $transfer;
-        $this->user = $user;
-    }
-
-    /**
-     * Get the notification's delivery channels.
-     *
-     * @return array<int, string>
-     */
-    public function via(object $notifiable): array
-    {
-        return ['database'];
-    }
-
-    /**
-     * Get the mail representation of the notification.
-     */
-    public function toMail(object $notifiable): MailMessage
-    {
-        $transferType = $this->getTransferType();
-        
-        return (new MailMessage)
-                    ->subject($transferType . ' عجلة')
-                    ->line('تم ' . $transferType . ' العجلة رقم: ' . $this->transfer->vehicle->id)
-                    ->line('نوع العجلة: ' . $this->transfer->vehicle->vehicle_type)
-                    ->line('رقم العجلة: ' . $this->transfer->vehicle->vehicle_number)
-                    ->line('المستلم: ' . $this->transfer->recipient_name)
-                    ->line('الجهة المستلمة: ' . $this->transfer->recipient_entity)
-                    ->line('تاريخ الاستلام: ' . $this->transfer->receive_date->format('Y-m-d'))
-                    ->line('تم بواسطة: ' . $this->user->name)
-                    ->action('عرض تفاصيل المناقلة', url('/transfers/' . $this->transfer->id));
-    }
-
-    /**
-     * Get the array representation of the notification.
-     *
-     * @return array<string, mixed>
-     */
-    public function toArray(object $notifiable): array
-    {
-        $transferType = $this->getTransferType();
-        
-        return [
-            'transfer_id' => $this->transfer->id,
-            'vehicle_id' => $this->transfer->vehicle->id,
-            'vehicle_type' => $this->transfer->vehicle->vehicle_type,
-            'vehicle_number' => $this->transfer->vehicle->vehicle_number,
-            'recipient_name' => $this->transfer->recipient_name,
-            'recipient_entity' => $this->transfer->recipient_entity,
-            'transfer_type' => $transferType,
-            'transfer_date' => $this->transfer->receive_date->format('Y-m-d'),
-            'user_id' => $this->user->id,
-            'user_name' => $this->user->name,
-        ];
-    }
-    
-    /**
-     * Get transfer type in Arabic.
-     */
-    private function getTransferType(): string
-    {
-        if ($this->transfer->is_ownership_transfer) {
-            return 'نقل ملكية';
-        } elseif ($this->transfer->is_referral) {
-            return 'إحالة خارجية';
-        } else {
-            return 'مناقلة';
-        }
+        return $events[$eventName] ?? $eventName;
     }
 }
 </file>
@@ -3666,7 +4346,9 @@ use Illuminate\Support\ServiceProvider;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Facades\Blade;
-
+use Illuminate\Support\Facades\Auth;
+use Spatie\Permission\Traits\HasRoles;
+use Spatie\Permission\Models\Role;
 class AppServiceProvider extends ServiceProvider
 {
     /**
@@ -3684,25 +4366,25 @@ class AppServiceProvider extends ServiceProvider
     {
         // Fix for MySQL < 5.7.7 and MariaDB < 10.2.2
         Schema::defaultStringLength(191);
-        
+
         // Use Bootstrap pagination
         Paginator::useBootstrap();
-        
+
         // Custom blade directives
         Blade::directive('money', function ($amount) {
             return "<?php echo number_format($amount, 2) . ' د.ع'; ?>";
         });
-        
+
         // Define an admin directive to check if user has admin role
         Blade::if('admin', function () {
             return auth()->check() && auth()->user()->hasRole('admin');
         });
-        
+
         // Define a role directive to check if user has a specific role
         Blade::if('role', function ($role) {
             return auth()->check() && auth()->user()->hasRole($role);
         });
-        
+
         // Define a permission directive to check if user has a specific permission
         Blade::if('permission', function ($permission) {
             return auth()->check() && auth()->user()->hasPermissionTo($permission);
@@ -3840,7 +4522,9 @@ return Application::configure(basePath: dirname(__DIR__))
 
 return [
     App\Providers\AppServiceProvider::class,
+    App\Providers\NotificationServiceProvider::class,
     App\Providers\PermissionServiceProvider::class,
+    Spatie\Permission\PermissionServiceProvider::class,
 ];
 </file>
 
@@ -3860,6 +4544,7 @@ return [
         "laravel/sanctum": "^4.0",
         "laravel/tinker": "^2.10.1",
         "laravel/ui": "^4.6",
+        "spatie/laravel-activitylog": "^4.10",
         "spatie/laravel-permission": "^6.16"
     },
     "require-dev": {
@@ -7250,7 +7935,6 @@ import './bootstrap';
 </file>
 
 <file path="resources/views/layouts/app.blade.php">
-<!-- resources/views/layouts/app.blade.php -->
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -7258,17 +7942,17 @@ import './bootstrap';
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    
+
     <title>@yield('title', 'نظام إدارة العجلات') - {{ config('app.name') }}</title>
-    
+
     <!-- Styles -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/sweetalert2@11.0.19/dist/sweetalert2.min.css">
-    
+
     <!-- RTL Bootstrap -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.rtl.min.css">
-    
+
     <!-- Custom CSS -->
     <style>
         body {
@@ -7323,41 +8007,91 @@ import './bootstrap';
             padding: 0.25rem 0.5rem;
             font-size: 0.75rem;
         }
+
+        /* Top bar elements - smaller font */
+        .navbar .dropdown-toggle {
+            font-size: 0.85rem;
+        }
+
+        .navbar .nav-link,
+        .navbar .text-white {
+            font-size: 0.85rem;
+        }
+
+        /* Improved dropdown styling */
         .dropdown-menu {
-        z-index: 1030; /* قيمة أعلى من z-index الافتراضي لضمان ظهور القائمة المنسدلة فوق العناصر الأخرى */
+            z-index: 1050; /* Higher z-index to ensure it displays above other elements */
+            width: 300px;
+            max-height: 400px;
+            overflow-y: auto;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            border-radius: 4px;
         }
-    
-            .navbar .dropdown-menu {
+
+        /* Notification dropdown positioning */
+        .navbar .dropdown-menu {
             position: absolute;
-            right: 0;
-            left: auto;
+            right: auto !important;
+            left: auto !important;
+            top: 100% !important;
+            transform: none !important;
+            margin-top: 0.5rem;
         }
-    
+
+        /* Mobile view adjustments */
         @media (max-width: 767.98px) {
             .navbar .dropdown-menu {
-                position: absolute;
-                right: 0;
-                left: auto;
-                width: 280px !important; /* عرض أصغر على الشاشات الصغيرة */
+                position: fixed;
+                right: 10px !important;
+                width: calc(100% - 20px) !important;
+                max-width: 300px;
+                left: auto !important;
             }
         }
-    
-        /* تحسين شكل عناصر القائمة المنسدلة */
+
+        /* Dropdown content styling */
+        .dropdown-menu .card {
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
         .dropdown-menu .list-group-item {
             border-left: none;
             border-right: none;
+            font-size: 0.85rem;
+            padding: 0.5rem 0.75rem;
         }
-    
+
         .dropdown-menu .list-group-item:first-child {
             border-top: none;
         }
-    
+
         .dropdown-menu .list-group-item:last-child {
             border-bottom: none;
         }
 
+        /* Small notification dot */
+        .bi-circle-fill {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        /* Make notification text smaller */
+        .dropdown-menu .small {
+            font-size: 0.8rem;
+        }
+
+        .dropdown-menu .fw-bold {
+            font-size: 0.85rem;
+        }
+
+        .dropdown-menu .text-muted {
+            font-size: 0.75rem;
+        }
     </style>
-    
+
     @stack('styles')
 </head>
 <body>
@@ -7365,33 +8099,33 @@ import './bootstrap';
         <a class="navbar-brand col-md-3 col-lg-2 me-0 px-3" href="{{ route('dashboard') }}">
             نظام إدارة العجلات
         </a>
-        <button class="navbar-toggler position-absolute d-md-none collapsed" type="button" 
-                data-bs-toggle="collapse" data-bs-target="#sidebarMenu" 
+        <button class="navbar-toggler position-absolute d-md-none collapsed" type="button"
+                data-bs-toggle="collapse" data-bs-target="#sidebarMenu"
                 aria-controls="sidebarMenu" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
         </button>
-        
+
         <!-- شريط البحث إذا كان موجودًا -->
         <div class="w-100"></div>
-        
+
         <!-- قائمة الإشعارات والمستخدم -->
         <div class="d-flex align-items-center">
             <!-- قائمة الإشعارات -->
             @auth
-            <div class="dropdown me-3">
-                <button class="btn btn-dark position-relative dropdown-toggle" type="button" id="notificationsDropdown" data-bs-toggle="dropdown" aria-expanded="false" style="background:none; border:none;">
+            <div class="dropdown me-3 position-static">
+                <button class="btn btn-dark position-relative dropdown-toggle" type="button" id="notificationsDropdown" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false" style="background:none; border:none;">
                     <i class="bi bi-bell text-light"></i>
-                    @if(auth()->user()->unreadNotifications()->count() > 0)
-                    <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
+                    @if(auth()->check() && auth()->user()->unreadNotifications()->count() > 0)
+                    <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="font-size: 0.65rem;">
                         {{ auth()->user()->unreadNotifications()->count() > 99 ? '99+' : auth()->user()->unreadNotifications()->count() }}
                     </span>
                     @endif
                 </button>
-                <div class="dropdown-menu dropdown-menu-end p-0" style="width: 320px; max-height: 400px; overflow-y: auto;">
+                <div class="dropdown-menu dropdown-menu-end p-0">
                     <div class="card m-0 border-0">
                         <div class="card-header bg-light d-flex justify-content-between py-2">
                             <span class="fw-bold">الإشعارات</span>
-                            @if(auth()->user()->unreadNotifications()->count() > 0)
+                            @if(auth()->check() && auth()->user()->unreadNotifications()->count() > 0)
                             <form action="{{ route('notifications.mark-all-as-read') }}" method="POST" class="d-inline">
                                 @csrf
                                 <button type="submit" class="btn btn-sm btn-link p-0 text-decoration-none">
@@ -7402,34 +8136,53 @@ import './bootstrap';
                         </div>
                         <div class="card-body p-0">
                             <div class="list-group list-group-flush">
-                                @forelse(auth()->user()->unreadNotifications()->take(5)->get() as $notification)
-                                <a href="{{ isset($notification->data['vehicle_id']) ? route('vehicles.show', $notification->data['vehicle_id']) : (isset($notification->data['transfer_id']) ? route('transfers.show', $notification->data['transfer_id']) : route('notifications.index')) }}" class="list-group-item list-group-item-action py-2 lh-sm">
-                                    <div class="d-flex w-100 align-items-center">
-                                        <div class="me-2">
-                                            <i class="bi bi-circle-fill text-primary" style="font-size: 0.5rem;"></i>
-                                        </div>
-                                        <div class="small w-100">
-                                            @if(isset($notification->data['status_type_name']))
-                                            <div class="text-muted">تحديث حالة عجلة</div>
-                                            <div>
-                                                {{ $notification->data['status_type_name'] ?? '' }}: 
-                                                {{ $notification->data['old_status'] ?? '' }} → {{ $notification->data['new_status'] ?? '' }}
+                                @if(auth()->check())
+                                    @forelse(auth()->user()->unreadNotifications()->take(5)->get() as $notification)
+                                    <a href="{{
+                                        isset($notification->data['action_url']) ? $notification->data['action_url'] :
+                                        (isset($notification->data['vehicle_id']) ? route('vehicles.show', $notification->data['vehicle_id']) :
+                                        (isset($notification->data['transfer_id']) ? route('transfers.show', $notification->data['transfer_id']) :
+                                        (isset($notification->data['edit_request_id']) ? route('edit-requests.show', $notification->data['edit_request_id']) :
+                                        route('notifications.index'))))
+                                    }}" class="list-group-item list-group-item-action py-2 lh-sm">
+                                        <div class="d-flex w-100 align-items-center">
+                                            <div class="me-2">
+                                                <i class="bi bi-circle-fill text-primary"></i>
                                             </div>
-                                            @elseif(isset($notification->data['transfer_type']))
-                                            <div class="text-muted">{{ $notification->data['transfer_type'] ?? 'مناقلة' }}</div>
-                                            <div>
-                                                {{ $notification->data['vehicle_type'] ?? '' }} - {{ $notification->data['vehicle_number'] ?? '' }}
+                                            <div class="small w-100">
+                                                <div class="fw-bold">{{ $notification->data['title'] ?? 'إشعار جديد' }}</div>
+                                                <div>{{ $notification->data['message'] ?? '' }}</div>
+                                                @if(isset($notification->data['vehicle_type']))
+                                                <div class="text-muted">
+                                                    العجلة: {{ $notification->data['vehicle_type'] }}
+                                                    @if(isset($notification->data['vehicle_number']) && $notification->data['vehicle_number'])
+                                                     - {{ $notification->data['vehicle_number'] }}
+                                                    @endif
+                                                    @if(isset($notification->data['vehicle_name']) && $notification->data['vehicle_name'])
+                                                     ({{ $notification->data['vehicle_name'] }})
+                                                    @endif
+                                                </div>
+                                                @endif
+                                                @if(isset($notification->data['old_status']) && isset($notification->data['new_status']))
+                                                <div class="text-muted">
+                                                    من: {{ $notification->data['old_status'] }} → إلى: {{ $notification->data['new_status'] }}
+                                                </div>
+                                                @endif
+                                                @if(isset($notification->data['causer_name']))
+                                                <div class="text-muted">
+                                                    تم بواسطة: {{ $notification->data['causer_name'] }}
+                                                </div>
+                                                @endif
+                                                <div class="text-muted mt-1">{{ $notification->created_at->diffForHumans() }}</div>
                                             </div>
-                                            @else
-                                            <div>إشعار جديد</div>
-                                            @endif
-                                            <div class="text-muted mt-1">{{ $notification->created_at->diffForHumans() }}</div>
                                         </div>
-                                    </div>
-                                </a>
-                                @empty
-                                <div class="list-group-item text-center text-muted py-3">لا توجد إشعارات جديدة</div>
-                                @endforelse
+                                    </a>
+                                    @empty
+                                    <div class="list-group-item text-center text-muted py-3">لا توجد إشعارات جديدة</div>
+                                    @endforelse
+                                @else
+                                    <div class="list-group-item text-center text-muted py-3">يرجى تسجيل الدخول لعرض الإشعارات</div>
+                                @endif
                             </div>
                         </div>
                         <div class="card-footer text-center p-2 bg-light">
@@ -7439,20 +8192,20 @@ import './bootstrap';
                 </div>
             </div>
             @endauth
-                                                
+
             <!-- اسم المستخدم -->
             <div class="px-3 text-white d-none d-md-block">
                 @auth
-                {{ auth()->user()->name }}
+                <span style="font-size: 0.85rem;">{{ auth()->user()->name }}</span>
                 @endauth
             </div>
-                                                
+
             <!-- زر تسجيل الخروج -->
             <div>
                 @auth
                 <form action="{{ route('logout') }}" method="POST">
                     @csrf
-                    <button type="submit" class="nav-link px-3 bg-dark border-0 text-white">
+                    <button type="submit" class="nav-link px-3 bg-dark border-0 text-white" style="font-size: 0.85rem;">
                         <i class="bi bi-box-arrow-right"></i> تسجيل الخروج
                     </button>
                 </form>
@@ -7467,37 +8220,37 @@ import './bootstrap';
                 <div class="position-sticky pt-3">
                     <ul class="nav flex-column">
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('dashboard') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('dashboard') ? 'active' : '' }}"
                                href="{{ route('dashboard') }}">
                                 <i class="bi bi-speedometer2"></i> لوحة التحكم
                             </a>
                         </li>
-                        
+
                         @can('view vehicles')
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('vehicles.*') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('vehicles.*') ? 'active' : '' }}"
                                href="{{ route('vehicles.index') }}">
                                 <i class="bi bi-truck"></i> العجلات
                             </a>
                         </li>
                         @endcan
-                        
+
                         @can('view transfers')
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('transfers.*') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('transfers.*') ? 'active' : '' }}"
                                href="{{ route('transfers.index') }}">
                                 <i class="bi bi-arrow-left-right"></i> المناقلات
                             </a>
                         </li>
                         @endcan
-                        
+
                         @can('view edit requests')
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('edit-requests.*') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('edit-requests.*') ? 'active' : '' }}"
                                href="{{ route('edit-requests.index') }}">
                                 <i class="bi bi-pencil-square"></i> طلبات التعديل
                                 @php
-                                    $pendingRequests = auth()->user()->hasRole('admin', 'verifier') 
+                                    $pendingRequests = auth()->user()->hasRole('admin', 'verifier')
                                         ? \App\Models\EditRequest::where('status', 'pending')->count()
                                         : \App\Models\EditRequest::where('user_id', auth()->id())
                                             ->where('status', 'pending')->count();
@@ -7508,24 +8261,32 @@ import './bootstrap';
                             </a>
                         </li>
                         @endcan
-                        
-                        @role('admin')
+
+                        <!-- Notification link available to all users -->
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('notifications.*') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('notifications.*') ? 'active' : '' }}"
                                href="{{ route('notifications.index') }}">
                                 <i class="bi bi-bell"></i> الإشعارات
-                                @if(auth()->user()->unreadNotifications()->count() > 0)
+                                @if(auth()->check() && auth()->user()->unreadNotifications()->count() > 0)
                                 <span class="badge bg-danger">{{ auth()->user()->unreadNotifications()->count() }}</span>
                                 @endif
                             </a>
                         </li>
+
+
+                        @role('admin')
                         <li class="nav-item">
-                            <a class="nav-link {{ Request::routeIs('users.*') ? 'active' : '' }}" 
+                            <a class="nav-link {{ Request::routeIs('vehicles.stalled') ? 'active' : '' }}"
+                               href="{{ route('vehicles.stalled') }}">
+                                <i class="bi bi-clock-history"></i> العجلات المتوقفة
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {{ Request::routeIs('users.*') ? 'active' : '' }}"
                                href="{{ route('users.index') }}">
                                 <i class="bi bi-people"></i> إدارة المستخدمين
                             </a>
                         </li>
-
                         @endrole
                     </ul>
                 </div>
@@ -7572,18 +8333,18 @@ import './bootstrap';
     <!-- Scripts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.0.19/dist/sweetalert2.min.js"></script>
-    
+
     <script>
         // Confirm delete
         document.addEventListener('DOMContentLoaded', function() {
             const deleteButtons = document.querySelectorAll('.btn-delete');
-            
+
             deleteButtons.forEach(button => {
                 button.addEventListener('click', function(e) {
                     e.preventDefault();
-                    
+
                     const form = this.closest('form');
-                    
+
                     Swal.fire({
                         title: 'هل أنت متأكد؟',
                         text: "لا يمكن التراجع عن هذا الإجراء!",
@@ -7602,7 +8363,7 @@ import './bootstrap';
             });
         });
     </script>
-    
+
     @stack('scripts')
 </body>
 </html>
@@ -7634,45 +8395,69 @@ import './bootstrap';
         @if($notifications->count() > 0)
             <div class="list-group">
                 @foreach($notifications as $notification)
-                    <div class="list-group-item list-group-item-action {{ is_null($notification->read_at) ? 'list-group-item-primary' : '' }}">
-                        <div class="d-flex w-100 justify-content-between">
-                            <h6 class="mb-1">{{ $notification->data['status_type_name'] ?? 'إشعار' }}</h6>
-                            <small>{{ $notification->created_at->diffForHumans() }}</small>
-                        </div>
-                        
-                        @if(isset($notification->data['vehicle_id']))
-                            <p class="mb-1">
-                                تم تحديث حالة العجلة: {{ $notification->data['vehicle_type'] ?? '' }} - {{ $notification->data['vehicle_number'] ?? 'بلا رقم' }}
-                            </p>
-                            <p class="mb-1">
-                                من: {{ $notification->data['old_status'] ?? '' }}
-                                <i class="bi bi-arrow-right"></i>
-                                إلى: {{ $notification->data['new_status'] ?? '' }}
-                            </p>
-                            <p class="mb-1">
-                                تم بواسطة: {{ $notification->data['updated_by_name'] ?? '' }}
-                            </p>
-                            <div class="d-flex justify-content-between align-items-center mt-2">
-                                <a href="{{ route('vehicles.show', $notification->data['vehicle_id']) }}" class="btn btn-sm btn-primary">
-                                    <i class="bi bi-eye"></i> عرض العجلة
-                                </a>
-                                
-                                @if(is_null($notification->read_at))
-                                <form action="{{ route('notifications.mark-as-read', $notification->id) }}" method="POST" class="d-inline">
-                                    @csrf
-                                    <button type="submit" class="btn btn-sm btn-secondary">
-                                        <i class="bi bi-check"></i> تحديد كمقروء
-                                    </button>
-                                </form>
-                                @endif
-                            </div>
-                        @else
-                            <p class="mb-1">{{ print_r($notification->data, true) }}</p>
+                <div class="list-group-item list-group-item-action {{ is_null($notification->read_at) ? 'list-group-item-primary' : '' }}">
+                    <div class="d-flex w-100 justify-content-between">
+                        <h6 class="mb-1">{{ $notification->data['title'] ?? 'إشعار' }}</h6>
+                        <small>{{ $notification->created_at->diffForHumans() }}</small>
+                    </div>
+                
+                    <p class="mb-1">{{ $notification->data['message'] ?? '' }}</p>
+                
+                    @if(isset($notification->data['vehicle_type']))
+                    <p class="mb-1">
+                        <strong>العجلة:</strong> {{ $notification->data['vehicle_type'] }}
+                        @if(isset($notification->data['vehicle_number']) && $notification->data['vehicle_number'])
+                         - {{ $notification->data['vehicle_number'] }}
+                        @endif
+                        @if(isset($notification->data['vehicle_name']) && $notification->data['vehicle_name'])
+                         ({{ $notification->data['vehicle_name'] }})
+                        @endif
+                    </p>
+                    @endif
+                
+                    @if(isset($notification->data['old_status']) && isset($notification->data['new_status']))
+                    <p class="mb-1">
+                        <strong>التغيير:</strong> من {{ $notification->data['old_status'] }}
+                        <i class="bi bi-arrow-right"></i>
+                        إلى {{ $notification->data['new_status'] }}
+                    </p>
+                    @endif
+                
+                    @if(isset($notification->data['causer_name']))
+                    <p class="mb-1">
+                        <strong>تم بواسطة:</strong> {{ $notification->data['causer_name'] }}
+                    </p>
+                    @endif
+                
+                    <div class="d-flex justify-content-between align-items-center mt-2">
+                        <a href="{{
+                            isset($notification->data['action_url']) ? $notification->data['action_url'] :
+                            (isset($notification->data['vehicle_id']) ? route('vehicles.show', $notification->data['vehicle_id']) :
+                            (isset($notification->data['transfer_id']) ? route('transfers.show', $notification->data['transfer_id']) :
+                            (isset($notification->data['edit_request_id']) ? route('edit-requests.show', $notification->data['edit_request_id']) :
+                            '#')))
+                        }}" class="btn btn-sm btn-primary">
+                            <i class="bi bi-eye"></i> {{
+                            isset($notification->data['vehicle_id']) ? 'عرض العجلة' :
+                            (isset($notification->data['transfer_id']) ? 'عرض المناقلة' :
+                            (isset($notification->data['edit_request_id']) ? 'عرض طلب التعديل' :
+                            'عرض التفاصيل'))
+                            }}
+                        </a>
+                    
+                        @if(is_null($notification->read_at))
+                        <form action="{{ route('notifications.mark-as-read', $notification->id) }}" method="POST" class="d-inline">
+                            @csrf
+                            <button type="submit" class="btn btn-sm btn-secondary">
+                                <i class="bi bi-check"></i> تحديد كمقروء
+                            </button>
+                        </form>
                         @endif
                     </div>
+                </div>
                 @endforeach
             </div>
-            
+
             <div class="mt-4">
                 {{ $notifications->links() }}
             </div>
@@ -11629,10 +12414,10 @@ Route::post('logout', [App\Http\Controllers\Auth\LoginController::class, 'logout
 Route::middleware(['auth'])->group(function () {
     // Dashboard
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
-    
+
     // Vehicles
     Route::resource('vehicles', VehicleController::class);
-    
+
     // Vehicle Status Updates
     Route::post('/vehicles/{vehicle}/update-seizure-status', [VehicleStatusController::class, 'updateSeizureStatus'])
         ->name('vehicles.update-seizure-status');
@@ -11646,14 +12431,14 @@ Route::middleware(['auth'])->group(function () {
         ->name('vehicles.update-donation-status');
     Route::post('/vehicles/{vehicle}/update-registration-status', [VehicleStatusController::class, 'updateRegistrationStatus'])
         ->name('vehicles.update-registration-status');
-    
+
     // Transfers
     Route::get('/transfers', [VehicleTransferController::class, 'index'])->name('transfers.index');
     Route::get('/vehicles/{vehicle}/transfers/create', [VehicleTransferController::class, 'create'])->name('transfers.create');
     Route::post('/vehicles/{vehicle}/transfers', [VehicleTransferController::class, 'store'])->name('transfers.store');
     Route::get('/transfers/{transfer}', [VehicleTransferController::class, 'show'])->name('transfers.show');
     Route::post('/transfers/{transfer}/complete', [VehicleTransferController::class, 'completeTransfer'])->name('transfers.complete');
-    
+
     // Edit Requests
     Route::get('/edit-requests', [EditRequestController::class, 'index'])->name('edit-requests.index');
     Route::get('/vehicles/{vehicle}/edit-requests/{field}/create', [EditRequestController::class, 'create'])->name('edit-requests.create');
@@ -11661,42 +12446,46 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/edit-requests/{editRequest}', [EditRequestController::class, 'show'])->name('edit-requests.show');
     Route::post('/edit-requests/{editRequest}/approve', [EditRequestController::class, 'approve'])->name('edit-requests.approve');
     Route::post('/edit-requests/{editRequest}/reject', [EditRequestController::class, 'reject'])->name('edit-requests.reject');
-    
+
     // Attachments
     Route::get('/attachments/{attachment}', [AttachmentController::class, 'show'])->name('attachments.show');
     Route::get('/attachments/{attachment}/download', [AttachmentController::class, 'download'])->name('attachments.download');
     Route::delete('/attachments/{attachment}', [AttachmentController::class, 'destroy'])->name('attachments.destroy');
-    
+
     // Users (admin only)
     Route::resource('users', UserController::class)->middleware('role:admin');
 
     // Vehicle ownership transfer and external referral routes
     Route::post('/vehicles/{vehicle}/transfer-ownership', [VehicleTransferController::class, 'transferOwnership'])
     ->name('vehicles.transfer-ownership');
-    
+
     Route::post('/vehicles/{vehicle}/external-referral', [VehicleTransferController::class, 'externalReferral'])
     ->name('vehicles.external-referral');
-    
+
     // Notifications
     Route::get('/notifications', [NotificationController::class, 'index'])->name('notifications.index');
     Route::post('/notifications/{id}/mark-as-read', [NotificationController::class, 'markAsRead'])->name('notifications.mark-as-read');
     Route::post('/notifications/mark-all-as-read', [NotificationController::class, 'markAllAsRead'])->name('notifications.mark-all-as-read');
+    Route::delete('/notifications/{id}', [NotificationController::class, 'destroy'])->name('notifications.destroy');
+    Route::delete('/notifications', [NotificationController::class, 'destroyAll'])->name('notifications.destroy-all');
+
+    Route::get('/vehicles/stalled', [VehicleController::class, 'stalled'])->name('vehicles.stalled')->middleware(['auth', 'role:admin']);
 
     Route::get('/api/check-recipient', function(Request $request) {
         $idNumber = $request->input('id_number');
         if (!$idNumber) {
             return response()->json(['count' => 0]);
         }
-        
+
         $count = VehicleTransfer::whereNull('return_date')
             ->where('recipient_id_number', $idNumber)
             ->where('is_ownership_transfer', false)
             ->where('is_referral', false)
             ->count();
-        
+
         return response()->json(['count' => $count]);
     })->middleware('auth')->name('api.check-recipient');
-    
+
 
 });
 </file>

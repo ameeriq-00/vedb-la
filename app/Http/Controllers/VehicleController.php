@@ -19,17 +19,17 @@ class VehicleController extends Controller
         $this->middleware('permission:edit vehicles')->only(['edit', 'update']);
         $this->middleware('permission:delete vehicles')->only('destroy');
     }
-    
+
     public function index(Request $request)
     {
         $user = Auth::user();
         $query = Vehicle::with(['directorate', 'user']);
-        
+
         // Apply filtering
         if ($request->has('type')) {
             $query->where('type', $request->type);
         }
-        
+
         if ($request->has('status')) {
             $status = $request->status;
             if ($status == 'محجوزة' || $status == 'مصادرة' || $status == 'مفرج عنها') {
@@ -42,11 +42,11 @@ class VehicleController extends Controller
                 $query->where('valuation_status', $status);
             }
         }
-        
+
         if ($request->has('directorate_id') && $user->hasRole(['admin', 'verifier'])) {
             $query->where('directorate_id', $request->directorate_id);
         }
-        
+
         if ($request->has('search')) {
             $search = $request->search;
             $query->where(function($q) use ($search) {
@@ -57,18 +57,18 @@ class VehicleController extends Controller
                   ->orWhere('defendant_name', 'like', "%{$search}%");
             });
         }
-        
+
         // Apply directorate restrictions based on user role
         $vehicles = $query->forUserDirectorate($user)
             ->latest()
             ->paginate(10)
             ->withQueryString();
-        
+
         $directorates = [];
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         return view('vehicles.index', compact('vehicles', 'directorates'));
     }
 
@@ -76,15 +76,15 @@ class VehicleController extends Controller
     {
         $user = Auth::user();
         $directorates = [];
-        
+
         // If admin or verifier, show all directorates
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         // تمكين مستخدمي الآليات من إضافة العجلات الحكومية
         $canAddGovernmentVehicle = $user->hasRole(['admin', 'verifier', 'vehicles_dept']);
-        
+
         return view('vehicles.create', compact('directorates', 'canAddGovernmentVehicle'));
     }
 
@@ -105,39 +105,39 @@ class VehicleController extends Controller
             'accessories' => 'nullable|array',
             'defects' => 'nullable|array',
             'missing_parts' => 'nullable|string',
-            
+
             // Confiscated vehicle fields
             'defendant_name' => 'required_if:type,confiscated|nullable|string|max:255',
             'legal_article' => 'required_if:type,confiscated|nullable|string|max:255',
             'seizure_status' => 'required_if:type,confiscated|nullable|in:محجوزة,مفرج عنها,مصادرة',
             'seizure_letter_number' => 'nullable|string|max:255',
             'seizure_letter_date' => 'nullable|date',
-            
+
             // Government vehicle fields
             'source' => 'required_if:type,government|nullable|string|max:255',
             'import_letter_number' => 'nullable|string|max:255',
             'import_letter_date' => 'nullable|date',
-            
+
             'images.*' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
             'attachments.*' => 'nullable|file|mimes:pdf,doc,docx|max:5120',
         ]);
-        
+
         // Create the vehicle
         $user = Auth::user();
-        
+
         // التحقق من صلاحية إضافة عجلات حكومية
         if ($validatedData['type'] == 'government' && !$user->hasRole(['admin', 'verifier', 'vehicles_dept'])) {
             return redirect()->route('vehicles.index')
                 ->with('error', 'ليس لديك صلاحية لإضافة العجلات الحكومية');
         }
-        
+
         // Set directorate_id to user's directorate if not admin/verifier
         if (!$user->hasRole(['admin', 'verifier'])) {
             $validatedData['directorate_id'] = $user->directorate_id;
         }
-        
+
         $validatedData['user_id'] = $user->id;
-        
+
         // Set default status for confiscated vehicles
         if ($validatedData['type'] == 'confiscated') {
             $validatedData['final_degree_status'] = 'غير مكتسبة';
@@ -146,15 +146,15 @@ class VehicleController extends Controller
             $validatedData['donation_status'] = 'غير مهداة';
             $validatedData['government_registration_status'] = 'غير مرقمة';
         }
-        
+
         $vehicle = Vehicle::create($validatedData);
-        
+
         // Handle images
         if ($request->hasFile('images')) {
             foreach ($request->file('images') as $image) {
                 $filename = time() . '_' . $image->getClientOriginalName();
                 $path = $image->storeAs('vehicle_images', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -167,13 +167,13 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         // Handle attachments
         if ($request->hasFile('attachments')) {
             foreach ($request->file('attachments') as $file) {
                 $filename = time() . '_' . $file->getClientOriginalName();
                 $path = $file->storeAs('vehicle_documents', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -186,7 +186,7 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم إضافة العجلة بنجاح');
     }
@@ -194,31 +194,31 @@ class VehicleController extends Controller
     public function show(Vehicle $vehicle)
     {
         $this->authorize('view', $vehicle);
-        
+
         $vehicle->load(['directorate', 'user', 'statuses.user', 'transfers.user', 'editRequests.user', 'attachments']);
-        
+
         return view('vehicles.show', compact('vehicle'));
     }
 
     public function edit(Vehicle $vehicle)
     {
         $this->authorize('update', $vehicle);
-        
+
         $user = Auth::user();
         $directorates = [];
-        
+
         // If admin or verifier, show all directorates
         if ($user->hasRole(['admin', 'verifier'])) {
             $directorates = Directorate::all();
         }
-        
+
         return view('vehicles.edit', compact('vehicle', 'directorates'));
     }
 
     public function update(Request $request, Vehicle $vehicle)
     {
         $this->authorize('update', $vehicle);
-        
+
         // Validate the request
         $validatedData = $request->validate([
             'type' => 'required|in:confiscated,government',
@@ -234,29 +234,29 @@ class VehicleController extends Controller
             'accessories' => 'nullable|array',
             'defects' => 'nullable|array',
             'missing_parts' => 'nullable|string',
-            
+
             // Confiscated vehicle fields
             'defendant_name' => 'required_if:type,confiscated|nullable|string|max:255',
             'legal_article' => 'required_if:type,confiscated|nullable|string|max:255',
-            
+
             // Don't allow updating status through this form
-            
+
             // Government vehicle fields
             'source' => 'required_if:type,government|nullable|string|max:255',
-            
+
             'notes' => 'nullable|string',
             'images.*' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
             'attachments.*' => 'nullable|file|mimes:pdf,doc,docx|max:5120',
         ]);
-        
+
         $vehicle->update($validatedData);
-        
+
         // Handle images
         if ($request->hasFile('images')) {
             foreach ($request->file('images') as $image) {
                 $filename = time() . '_' . $image->getClientOriginalName();
                 $path = $image->storeAs('vehicle_images', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -269,13 +269,13 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         // Handle attachments
         if ($request->hasFile('attachments')) {
             foreach ($request->file('attachments') as $file) {
                 $filename = time() . '_' . $file->getClientOriginalName();
                 $path = $file->storeAs('vehicle_documents', $filename, 'public');
-                
+
                 Attachment::create([
                     'attachable_type' => 'App\Models\Vehicle',
                     'attachable_id' => $vehicle->id,
@@ -288,7 +288,7 @@ class VehicleController extends Controller
                 ]);
             }
         }
-        
+
         return redirect()->route('vehicles.show', $vehicle)
             ->with('success', 'تم تحديث العجلة بنجاح');
     }
@@ -296,15 +296,63 @@ class VehicleController extends Controller
     public function destroy(Vehicle $vehicle)
     {
         $this->authorize('delete', $vehicle);
-        
+
         // Delete associated files
         foreach ($vehicle->attachments as $attachment) {
             Storage::disk('public')->delete($attachment->file_path);
         }
-        
+
         $vehicle->delete();
-        
+
         return redirect()->route('vehicles.index')
             ->with('success', 'تم حذف العجلة بنجاح');
+    }
+    public function stalled()
+    {
+        // Ensure only admin can access
+        $this->authorize('view', Vehicle::class);
+
+        // Get vehicles that haven't changed status in 2 months
+        $twoMonthsAgo = now()->subMonths(2);
+
+        // Get stalled vehicles for different status types
+        $stalledVehicles = [
+            'seizure' => Vehicle::confiscated()
+                ->where('seizure_status', 'محجوزة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'confiscation' => Vehicle::confiscated()
+                ->where('seizure_status', 'مصادرة')
+                ->where('final_degree_status', 'غير مكتسبة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'final_degree' => Vehicle::confiscated()
+                ->where('final_degree_status', 'مكتسبة')
+                ->where('valuation_status', 'غير مثمنة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'valuation' => Vehicle::confiscated()
+                ->where('valuation_status', 'مثمنة')
+                ->where('authentication_status', 'غير مصادق عليها')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'authentication' => Vehicle::confiscated()
+                ->where('authentication_status', 'تمت المصادقة عليها')
+                ->where('donation_status', 'غير مهداة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+
+            'donation' => Vehicle::confiscated()
+                ->where('donation_status', 'مهداة')
+                ->where('government_registration_status', 'غير مرقمة')
+                ->where('updated_at', '<', $twoMonthsAgo)
+                ->get(),
+        ];
+
+        return view('vehicles.stalled', compact('stalledVehicles'));
     }
 }
